@@ -12,22 +12,19 @@ import (
 	"time"
 )
 
-// ServicePool agrupa las instancias de un servicio para hacer load balancing.
-// Usamos Round Robin: cada petición va a la siguiente instancia de la lista.
+// ServicePool maneja las instancias de un servicio con round robin
 type ServicePool struct {
 	instances []string
-	counter   uint64 // contador atómico para round robin
+	counter   uint64
 }
 
-// Next devuelve la siguiente URL disponible (round robin)
+// Next devuelve la siguiente instancia disponible
 func (sp *ServicePool) Next() string {
 	idx := atomic.AddUint64(&sp.counter, 1) % uint64(len(sp.instances))
 	return sp.instances[idx]
 }
 
-// registry es el "Service Discovery" estático.
-// Aquí declaramos qué servicios existen y en qué URLs viven.
-// En un sistema real esto sería dinámico (Consul, etcd, etc.)
+// registry mapea cada servicio a sus instancias (service discovery)
 var registry = map[string]*ServicePool{
 	"order-service": {instances: []string{
 		"http://order-service:8081",
@@ -40,23 +37,20 @@ var registry = map[string]*ServicePool{
 	}},
 }
 
-// proxyTo reenvía la petición al servicio destino usando un Reverse Proxy
+// proxyTo redirige la petición al servicio indicado
 func proxyTo(target string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		u, _ := url.Parse(target)
 		proxy := httputil.NewSingleHostReverseProxy(u)
-
-		// Agregamos header para saber qué instancia atendió la petición
 		r.Header.Set("X-Forwarded-By", "gateway")
 		w.Header().Set("X-Served-By", target)
-
 		proxy.ServeHTTP(w, r)
 	}
 }
 
-// route decide a qué servicio mandar la petición según el path
+// route enruta la petición al servicio correcto según el path
 func route(w http.ResponseWriter, r *http.Request) {
-	// CORS para el frontend
+	// headers CORS
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
@@ -86,7 +80,7 @@ func route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// healthCheck muestra el estado de todos los servicios registrados
+// healthCheck consulta el estado de cada servicio
 func healthCheck(w http.ResponseWriter, r *http.Request) {
 	type ServiceStatus struct {
 		Service string `json:"service"`
@@ -120,7 +114,7 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(results)
 }
 
-// services muestra el registro de servicios (service discovery)
+// services devuelve el registro de servicios
 func services(w http.ResponseWriter, r *http.Request) {
 	type ServiceInfo struct {
 		Service   string   `json:"service"`
@@ -140,7 +134,6 @@ func services(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// Rutas del gateway
 	http.HandleFunc("/orders", route)
 	http.HandleFunc("/orders/", route)
 	http.HandleFunc("/orders/create", route)
@@ -149,8 +142,6 @@ func main() {
 	http.HandleFunc("/users", route)
 	http.HandleFunc("/users/", route)
 	http.HandleFunc("/users/create", route)
-
-	// Rutas de administración del propio gateway
 	http.HandleFunc("/health", healthCheck)
 	http.HandleFunc("/services", services)
 

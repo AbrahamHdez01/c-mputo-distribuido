@@ -11,7 +11,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// User representa un usuario del sistema.
+// User es la estructura de un trader registrado
 type User struct {
 	ID        int       `json:"id"`
 	Name      string    `json:"name"`
@@ -40,14 +40,13 @@ func initDB() {
 		log.Fatal("Error creando tabla users:", err)
 	}
 
-	// Usuario de prueba inicial
 	db.Exec(`INSERT OR IGNORE INTO users (name, email, balance, created_at) VALUES (?, ?, ?, ?)`,
 		"Trader Demo", "demo@mercado.com", 10000.0, time.Now())
 
 	log.Println("Base de datos de usuarios lista.")
 }
 
-// GET /users — devuelve todos los usuarios
+// getUsers devuelve todos los usuarios
 func getUsers(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query("SELECT id, name, email, balance, created_at FROM users")
 	if err != nil {
@@ -67,7 +66,7 @@ func getUsers(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(users)
 }
 
-// POST /users — crea un nuevo usuario
+// createUser registra un nuevo trader
 func createUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)
@@ -80,7 +79,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if u.Balance == 0 {
-		u.Balance = 10000.0 // balance inicial por defecto
+		u.Balance = 10000.0
 	}
 	u.CreatedAt = time.Now()
 

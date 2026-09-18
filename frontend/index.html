@@ -204,15 +204,12 @@
 </div>
 
 <script>
-    // La URL base del gateway. Al estar en la misma red Docker,
-    // el navegador accede por el host de la máquina.
     const GATEWAY = 'http://localhost:8080';
 
-    // Mapa de precios actuales: { "BTC/USD": 65000.12, ... }
-    // Se actualiza cada vez que loadPrices() recibe datos del servidor.
+    // precios más recientes recibidos del servidor
     const marketPrices = {};
 
-    // Actualiza el campo de precio del formulario con el precio del par seleccionado
+    // actualiza el campo de precio con el par seleccionado
     function syncPriceInput() {
         const symbol = document.getElementById('symbolSelect').value;
         const input  = document.getElementById('priceInput');
@@ -221,15 +218,12 @@
         }
     }
 
-    // --- Precios ---
     function loadPrices() {
         fetch(`${GATEWAY}/prices`)
             .then(r => r.json())
             .then(prices => {
-                // Guardar en el mapa local
                 prices.forEach(p => { marketPrices[p.symbol] = p.price; });
 
-                // Actualizar las tarjetas visuales
                 const grid = document.getElementById('pricesGrid');
                 grid.innerHTML = prices.map(p => `
                     <div class="price-card">
@@ -238,7 +232,6 @@
                     </div>
                 `).join('');
 
-                // Sincronizar el campo de precio del formulario
                 syncPriceInput();
             })
             .catch(() => {
@@ -247,7 +240,6 @@
             });
     }
 
-    // --- Órdenes ---
     function loadOrders() {
         fetch(`${GATEWAY}/orders`)
             .then(r => r.json())
@@ -257,7 +249,6 @@
                     tbody.innerHTML = '<tr><td colspan="6" style="color:#718096">Sin órdenes todavía</td></tr>';
                     return;
                 }
-                // Mostrar las más recientes primero
                 tbody.innerHTML = [...orders].reverse().map(o => `
                     <tr>
                         <td>${o.id}</td>
@@ -275,8 +266,6 @@
             });
     }
 
-    // --- Formulario de orden ---
-    // Al cambiar el par, actualizar el precio del formulario
     document.getElementById('symbolSelect').addEventListener('change', syncPriceInput);
 
     document.getElementById('sideSelect').addEventListener('change', function() {
@@ -287,7 +276,6 @@
         const symbol = document.getElementById('symbolSelect').value;
 
         if (this.value === 'BUY') {
-            // BUY: precio fijo de mercado, solo lectura
             input.readOnly = true;
             input.style.cursor  = 'default';
             input.style.color   = '#48bb78';
@@ -295,7 +283,6 @@
             hint.style.display  = 'none';
             syncPriceInput();
         } else {
-            // SELL: precio editable, se sugiere el precio de mercado como mínimo
             input.readOnly = false;
             input.style.cursor  = 'text';
             input.style.color   = '#fc8181';
@@ -304,8 +291,8 @@
             const mp = marketPrices[symbol];
             if (mp) {
                 document.getElementById('marketPriceRef').textContent = mp.toFixed(2);
-                input.min   = mp.toFixed(2); // no puede vender por debajo del mercado
-                input.value = mp.toFixed(2); // sugerencia inicial
+                input.min   = mp.toFixed(2);
+                input.value = mp.toFixed(2);
             }
         }
 
@@ -332,7 +319,6 @@
         .catch(() => showStatus('status', 'Error al enviar la orden', 'err'));
     });
 
-    // --- Formulario de usuario ---
     document.getElementById('userForm').addEventListener('submit', function(e) {
         e.preventDefault();
         const data = Object.fromEntries(new FormData(this));

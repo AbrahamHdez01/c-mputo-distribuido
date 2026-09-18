@@ -12,7 +12,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// Price representa el precio de un par de monedas en un momento dado.
+// Price guarda el precio actual de un par de monedas
 type Price struct {
 	ID        int       `json:"id"`
 	Symbol    string    `json:"symbol"`
@@ -22,7 +22,7 @@ type Price struct {
 
 var db *sql.DB
 
-// Precios iniciales de los pares del mercado
+// precios con los que arranca el sistema
 var seedPrices = map[string]float64{
 	"BTC/USD": 65000.0,
 	"ETH/USD": 3500.0,
@@ -46,7 +46,6 @@ func initDB() {
 		log.Fatal("Error creando tabla prices:", err)
 	}
 
-	// Insertar precios iniciales si la tabla está vacía
 	for symbol, price := range seedPrices {
 		db.Exec(`INSERT OR IGNORE INTO prices (symbol, price, updated_at) VALUES (?, ?, ?)`,
 			symbol, price, time.Now())
@@ -55,7 +54,7 @@ func initDB() {
 	log.Println("Base de datos de precios lista.")
 }
 
-// simulateMarket actualiza los precios cada 5 segundos con variación aleatoria pequeña
+// simulateMarket aplica una variación aleatoria a los precios cada 5 segundos
 func simulateMarket() {
 	for {
 		time.Sleep(5 * time.Second)
@@ -76,8 +75,7 @@ func simulateMarket() {
 		rows.Close()
 
 		for _, r := range toUpdate {
-			// Variación aleatoria de ±0.5%
-			change := (rand.Float64() - 0.5) * 0.01
+			change := (rand.Float64() - 0.5) * 0.01 // ±0.5%
 			newPrice := r.price * (1 + change)
 			db.Exec("UPDATE prices SET price = ?, updated_at = ? WHERE id = ?",
 				newPrice, time.Now(), r.id)
@@ -85,7 +83,7 @@ func simulateMarket() {
 	}
 }
 
-// GET /prices — devuelve todos los precios actuales
+// getPrices devuelve los precios actuales
 func getPrices(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query("SELECT id, symbol, price, updated_at FROM prices")
 	if err != nil {
@@ -108,7 +106,6 @@ func getPrices(w http.ResponseWriter, r *http.Request) {
 func main() {
 	initDB()
 
-	// Goroutine que simula cambios de precio en el mercado
 	go simulateMarket()
 
 	http.HandleFunc("/prices", getPrices)

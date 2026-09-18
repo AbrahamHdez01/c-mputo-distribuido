@@ -5,12 +5,9 @@ import (
 	"net/http"
 )
 
-// Recovery atrapa cualquier panic que ocurra dentro de un handler
-// y en vez de tirar abajo todo el servidor, devuelve un error 500.
-// Sin esto, un solo bug haría caer toda la app.
+// Recovery atrapa panics y devuelve 500 en lugar de caerse
 func Recovery(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// defer + recover = si algo explota, lo atrapamos aquí
 		defer func() {
 			if err := recover(); err != nil {
 				requestID := GetRequestID(r.Context())

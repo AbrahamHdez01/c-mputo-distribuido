@@ -11,7 +11,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// Order representa una orden de compra/venta en el mercado.
+// Order es la estructura de una orden de trading
 type Order struct {
 	ID        int       `json:"id"`
 	Symbol    string    `json:"symbol"`
@@ -31,7 +31,6 @@ func initDB() {
 		log.Fatal("Error abriendo la base de datos:", err)
 	}
 
-	// Crear la tabla si no existe
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS orders (
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
 		symbol     TEXT    NOT NULL,
@@ -48,7 +47,7 @@ func initDB() {
 	log.Println("Base de datos de órdenes lista.")
 }
 
-// GET /orders — devuelve todas las órdenes en JSON
+// getOrders devuelve todas las órdenes
 func getOrders(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query("SELECT id, symbol, side, price, amount, status, created_at FROM orders")
 	if err != nil {
@@ -68,7 +67,7 @@ func getOrders(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(orders)
 }
 
-// POST /orders — crea una nueva orden
+// createOrder guarda una nueva orden en la DB
 func createOrder(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)

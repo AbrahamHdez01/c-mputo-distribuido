@@ -7,11 +7,8 @@ import (
 	"simulador-mercado/middleware"
 )
 
-// chain aplica una lista de middlewares a un handler.
-// El orden importa: el primero en la lista es el más externo (se ejecuta primero).
-// Aquí el orden es: Recovery → RequestID → Logger → CORS → handler real
+// chain aplica middlewares a un handler, de afuera hacia adentro
 func chain(h http.HandlerFunc, middlewares ...func(http.HandlerFunc) http.HandlerFunc) http.HandlerFunc {
-	// Aplicamos los middlewares de derecha a izquierda
 	for i := len(middlewares) - 1; i >= 0; i-- {
 		h = middlewares[i](h)
 	}
@@ -19,15 +16,15 @@ func chain(h http.HandlerFunc, middlewares ...func(http.HandlerFunc) http.Handle
 }
 
 func main() {
-	// Stack de middlewares que se aplica a todas las rutas
+	// middlewares que se usan en todas las rutas
 	stack := []func(http.HandlerFunc) http.HandlerFunc{
-		middleware.Recovery,   // 1. Atrapa panics — siempre primero
-		middleware.RequestID,  // 2. Genera el ID de la petición
-		middleware.Logger,     // 3. Loguea (ya tiene el RequestID disponible)
-		middleware.CORS,       // 4. Agrega headers CORS
+		middleware.Recovery,
+		middleware.RequestID,
+		middleware.Logger,
+		middleware.CORS,
 	}
 
-	// Rutas
+	// rutas
 	http.HandleFunc("/", chain(func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "views/index.html")
 	}, stack...))
