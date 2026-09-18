@@ -1,0 +1,12 @@
+# Binarios compilados de Go
+gateway/gateway
+services/order-service/order-service
+services/price-service/price-service
+services/user-service/user-service
+simulador-mercado
+
+# Bases de datos SQLite locales
+*.db
+
+# Variables de entorno
+.env

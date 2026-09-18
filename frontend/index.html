@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simulador de Mercado</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, "Segoe UI", sans-serif;
+            background: #0f1117;
+            color: #e2e8f0;
+            min-height: 100vh;
+        }
+
+        header {
+            background: #1a1d2e;
+            border-bottom: 1px solid #2d3748;
+            padding: 1rem 2rem;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+        header h1 { font-size: 1.4rem; color: #63b3ed; }
+        header span { font-size: 0.85rem; color: #718096; }
+
+        .container { max-width: 1100px; margin: 0 auto; padding: 2rem; }
+
+        /* Grid de precios */
+        .prices-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .price-card {
+            background: #1a1d2e;
+            border: 1px solid #2d3748;
+            border-radius: 8px;
+            padding: 1.2rem;
+        }
+        .price-card .symbol { font-size: 0.85rem; color: #718096; }
+        .price-card .value { font-size: 1.6rem; font-weight: 700; color: #48bb78; margin: 0.3rem 0; }
+
+        /* Layout de 2 columnas */
+        .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+
+        .panel {
+            background: #1a1d2e;
+            border: 1px solid #2d3748;
+            border-radius: 8px;
+            padding: 1.5rem;
+        }
+        .panel h2 { font-size: 1rem; color: #a0aec0; margin-bottom: 1.2rem; border-bottom: 1px solid #2d3748; padding-bottom: 0.8rem; }
+
+        /* Formulario */
+        form { display: flex; flex-direction: column; gap: 0.8rem; }
+        label { font-size: 0.8rem; color: #718096; }
+        input, select {
+            width: 100%;
+            padding: 0.6rem 0.8rem;
+            background: #0f1117;
+            border: 1px solid #2d3748;
+            border-radius: 6px;
+            color: #e2e8f0;
+            font-size: 0.9rem;
+        }
+        button {
+            padding: 0.7rem;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 0.4rem;
+        }
+        .btn-buy  { background: #276749; color: #fff; }
+        .btn-sell { background: #9b2c2c; color: #fff; }
+        .btn-user { background: #2b4c8c; color: #fff; }
+
+        /* Tabla de órdenes */
+        table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+        th { color: #718096; font-weight: 600; text-align: left; padding: 0.5rem 0.4rem; border-bottom: 1px solid #2d3748; }
+        td { padding: 0.5rem 0.4rem; border-bottom: 1px solid #1e2233; }
+        .buy  { color: #48bb78; font-weight: 600; }
+        .sell { color: #fc8181; font-weight: 600; }
+        .badge {
+            display: inline-block;
+            padding: 0.15rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            background: #2d3748;
+            color: #a0aec0;
+        }
+
+        /* Status + mensajes */
+        #status {
+            font-size: 0.8rem;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            margin-top: 1rem;
+            display: none;
+        }
+        .ok   { background: #1c4532; color: #68d391; display: block !important; }
+        .err  { background: #4a1a1a; color: #fc8181; display: block !important; }
+
+        .section-title {
+            font-size: 0.75rem;
+            color: #718096;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin: 1.5rem 0 0.8rem;
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>Simulador de Mercado</h1>
+    <span>Cómputo Distribuido — Arquitectura de Microservicios</span>
+</header>
+
+<div class="container">
+
+    <!-- Precios en vivo -->
+    <p class="section-title">Precios en vivo (se actualizan cada 5s)</p>
+    <div class="prices-grid" id="pricesGrid">
+        <div class="price-card"><div class="symbol">Cargando...</div></div>
+    </div>
+
+    <div class="columns">
+
+        <!-- Panel izquierdo: crear orden -->
+        <div>
+            <div class="panel">
+                <h2>Nueva Orden de Trading</h2>
+                <form id="orderForm">
+                    <label>Par de monedas</label>
+                    <select name="symbol" id="symbolSelect">
+                        <option value="BTC/USD">BTC/USD</option>
+                        <option value="ETH/USD">ETH/USD</option>
+                        <option value="SOL/USD">SOL/USD</option>
+                    </select>
+
+                    <label>Tipo de orden</label>
+                    <select name="side" id="sideSelect">
+                        <option value="BUY">Comprar (BUY)</option>
+                        <option value="SELL">Vender (SELL)</option>
+                    </select>
+
+                    <label id="priceLabel">Precio de mercado (USD)</label>
+                    <input type="number" name="price" id="priceInput" step="0.01" readonly
+                           style="background:#1a1d2e; color:#48bb78; font-weight:700; cursor:default;" required>
+                    <small id="priceHint" style="color:#718096; font-size:0.75rem; display:none;">
+                        Precio minimo sugerido: <span id="marketPriceRef"></span> USD
+                    </small>
+
+                    <label>Cantidad</label>
+                    <input type="number" name="amount" step="0.001" value="0.1" required>
+
+                    <button type="submit" class="btn-buy" id="submitBtn">Enviar Orden</button>
+                </form>
+                <div id="status"></div>
+            </div>
+
+            <!-- Crear usuario -->
+            <div class="panel" style="margin-top:1rem;">
+                <h2>Registrar Trader</h2>
+                <form id="userForm">
+                    <label>Nombre</label>
+                    <input type="text" name="name" placeholder="Ej: Ana López" required>
+
+                    <label>Email</label>
+                    <input type="email" name="email" placeholder="ana@example.com" required>
+
+                    <button type="submit" class="btn-user">Registrar</button>
+                </form>
+                <div id="userStatus"></div>
+            </div>
+        </div>
+
+        <!-- Panel derecho: libro de órdenes -->
+        <div class="panel">
+            <h2>Libro de Órdenes</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Par</th>
+                        <th>Tipo</th>
+                        <th>Precio</th>
+                        <th>Cantidad</th>
+                        <th>Estado</th>
+                    </tr>
+                </thead>
+                <tbody id="ordersBody">
+                    <tr><td colspan="6" style="color:#718096">Cargando órdenes...</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+    </div>
+</div>
+
+<script>
+    // La URL base del gateway. Al estar en la misma red Docker,
+    // el navegador accede por el host de la máquina.
+    const GATEWAY = 'http://localhost:8080';
+
+    // Mapa de precios actuales: { "BTC/USD": 65000.12, ... }
+    // Se actualiza cada vez que loadPrices() recibe datos del servidor.
+    const marketPrices = {};
+
+    // Actualiza el campo de precio del formulario con el precio del par seleccionado
+    function syncPriceInput() {
+        const symbol = document.getElementById('symbolSelect').value;
+        const input  = document.getElementById('priceInput');
+        if (marketPrices[symbol]) {
+            input.value = marketPrices[symbol].toFixed(2);
+        }
+    }
+
+    // --- Precios ---
+    function loadPrices() {
+        fetch(`${GATEWAY}/prices`)
+            .then(r => r.json())
+            .then(prices => {
+                // Guardar en el mapa local
+                prices.forEach(p => { marketPrices[p.symbol] = p.price; });
+
+                // Actualizar las tarjetas visuales
+                const grid = document.getElementById('pricesGrid');
+                grid.innerHTML = prices.map(p => `
+                    <div class="price-card">
+                        <div class="symbol">${p.symbol}</div>
+                        <div class="value">$${p.price.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</div>
+                    </div>
+                `).join('');
+
+                // Sincronizar el campo de precio del formulario
+                syncPriceInput();
+            })
+            .catch(() => {
+                document.getElementById('pricesGrid').innerHTML =
+                    '<div class="price-card"><div class="symbol" style="color:#fc8181">Error conectando al gateway</div></div>';
+            });
+    }
+
+    // --- Órdenes ---
+    function loadOrders() {
+        fetch(`${GATEWAY}/orders`)
+            .then(r => r.json())
+            .then(orders => {
+                const tbody = document.getElementById('ordersBody');
+                if (!orders || orders.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="color:#718096">Sin órdenes todavía</td></tr>';
+                    return;
+                }
+                // Mostrar las más recientes primero
+                tbody.innerHTML = [...orders].reverse().map(o => `
+                    <tr>
+                        <td>${o.id}</td>
+                        <td>${o.symbol}</td>
+                        <td class="${o.side === 'BUY' ? 'buy' : 'sell'}">${o.side}</td>
+                        <td>$${o.price.toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                        <td>${o.amount}</td>
+                        <td><span class="badge">${o.status}</span></td>
+                    </tr>
+                `).join('');
+            })
+            .catch(() => {
+                document.getElementById('ordersBody').innerHTML = 
+                    '<tr><td colspan="6" style="color:#fc8181">Error cargando órdenes</td></tr>';
+            });
+    }
+
+    // --- Formulario de orden ---
+    // Al cambiar el par, actualizar el precio del formulario
+    document.getElementById('symbolSelect').addEventListener('change', syncPriceInput);
+
+    document.getElementById('sideSelect').addEventListener('change', function() {
+        const btn    = document.getElementById('submitBtn');
+        const input  = document.getElementById('priceInput');
+        const label  = document.getElementById('priceLabel');
+        const hint   = document.getElementById('priceHint');
+        const symbol = document.getElementById('symbolSelect').value;
+
+        if (this.value === 'BUY') {
+            // BUY: precio fijo de mercado, solo lectura
+            input.readOnly = true;
+            input.style.cursor  = 'default';
+            input.style.color   = '#48bb78';
+            label.textContent   = 'Precio de mercado (USD)';
+            hint.style.display  = 'none';
+            syncPriceInput();
+        } else {
+            // SELL: precio editable, se sugiere el precio de mercado como mínimo
+            input.readOnly = false;
+            input.style.cursor  = 'text';
+            input.style.color   = '#fc8181';
+            label.textContent   = 'Tu precio de venta (USD)';
+            hint.style.display  = 'block';
+            const mp = marketPrices[symbol];
+            if (mp) {
+                document.getElementById('marketPriceRef').textContent = mp.toFixed(2);
+                input.min   = mp.toFixed(2); // no puede vender por debajo del mercado
+                input.value = mp.toFixed(2); // sugerencia inicial
+            }
+        }
+
+        btn.className   = this.value === 'BUY' ? 'btn-buy' : 'btn-sell';
+        btn.textContent = this.value === 'BUY' ? 'Comprar' : 'Vender';
+    });
+
+    document.getElementById('orderForm').addEventListener('submit', function(e) {
+        e.preventDefault();
+        const data = Object.fromEntries(new FormData(this));
+        data.price  = parseFloat(data.price);
+        data.amount = parseFloat(data.amount);
+
+        fetch(`${GATEWAY}/orders/create`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        })
+        .then(r => r.json())
+        .then(order => {
+            showStatus('status', `Orden #${order.id} creada: ${order.side} ${order.amount} ${order.symbol} @ $${order.price}`, 'ok');
+            loadOrders();
+        })
+        .catch(() => showStatus('status', 'Error al enviar la orden', 'err'));
+    });
+
+    // --- Formulario de usuario ---
+    document.getElementById('userForm').addEventListener('submit', function(e) {
+        e.preventDefault();
+        const data = Object.fromEntries(new FormData(this));
+
+        fetch(`${GATEWAY}/users/create`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        })
+        .then(r => {
+            if (!r.ok) throw new Error('conflict');
+            return r.json();
+        })
+        .then(u => {
+            showStatus('userStatus', `Trader "${u.name}" registrado con balance $${u.balance}`, 'ok');
+            this.reset();
+        })
+        .catch(() => showStatus('userStatus', 'Error al registrar (email ya existe?)', 'err'));
+    });
+
+    function showStatus(id, msg, cls) {
+        const el = document.getElementById(id);
+        el.textContent = msg;
+        el.className = cls;
+        setTimeout(() => { el.className = ''; }, 5000);
+    }
+
+    // Cargar datos al inicio y refrescar cada 5s
+    loadPrices();
+    loadOrders();
+    setInterval(loadPrices, 5000);
+    setInterval(loadOrders, 5000);
+</script>
+
+</body>
+</html>

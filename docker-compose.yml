@@ -1,0 +1,82 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIMULADOR DE MERCADO — Arquitectura de Microservicios
+#
+# Contenedores:
+#   frontend      → Nginx sirviendo la SPA en localhost:3000
+#   gateway       → API Gateway (load balancer + service discovery) en :8080
+#   order-service → Microservicio de órdenes con SQLite en :8081
+#   price-service → Microservicio de precios con SQLite en :8082
+#   user-service  → Microservicio de usuarios con SQLite en :8083
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Frontend ───────────────────────────────────────────────────────────────
+  frontend:
+    build: ./frontend
+    container_name: frontend
+    ports:
+      - "3000:80"       # acceder en http://localhost:3000
+    depends_on:
+      - gateway
+    networks:
+      - mercado-net
+
+  # ── Gateway (Middleware + Load Balancer) ───────────────────────────────────
+  gateway:
+    build: ./gateway
+    container_name: gateway
+    ports:
+      - "8080:8080"     # acceder en http://localhost:8080
+    depends_on:
+      - order-service
+      - price-service
+      - user-service
+    networks:
+      - mercado-net
+
+  # ── Microservicio: Órdenes ─────────────────────────────────────────────────
+  order-service:
+    build: ./services/order-service
+    container_name: order-service
+    ports:
+      - "8081:8081"
+    volumes:
+      - order-data:/data   # persiste la base de datos SQLite
+    networks:
+      - mercado-net
+
+  # ── Microservicio: Precios ─────────────────────────────────────────────────
+  price-service:
+    build: ./services/price-service
+    container_name: price-service
+    ports:
+      - "8082:8082"
+    volumes:
+      - price-data:/data
+    networks:
+      - mercado-net
+
+  # ── Microservicio: Usuarios ────────────────────────────────────────────────
+  user-service:
+    build: ./services/user-service
+    container_name: user-service
+    ports:
+      - "8083:8083"
+    volumes:
+      - user-data:/data
+    networks:
+      - mercado-net
+
+# ── Red interna ────────────────────────────────────────────────────────────
+networks:
+  mercado-net:
+    driver: bridge
+
+# ── Volúmenes persistentes para las bases de datos ────────────────────────
+volumes:
+  order-data:
+  price-data:
+  user-data:

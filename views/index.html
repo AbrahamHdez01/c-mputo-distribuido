@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Simulador de Mercado - MVC</title>
+</head>
+<body>
+    <h1>Simulador de Mercado (Order Book)</h1>
+
+    <h2>Crear Orden</h2>
+    <form action="/orders/create" method="POST">
+        <label>Par:</label>
+        <input type="text" name="symbol" value="BTC/USD"><br><br>
+
+        <label>Tipo:</label>
+        <select name="side">
+            <option value="BUY">Comprar (BUY)</option>
+            <option value="SELL">Vender (SELL)</option>
+        </select><br><br>
+
+        <label>Precio ($):</label>
+        <input type="number" step="0.01" name="price" value="60000"><br><br>
+
+        <label>Cantidad:</label>
+        <input type="number" step="0.01" name="amount" value="1.0"><br><br>
+
+        <button type="submit">Enviar Orden</button>
+    </form>
+
+    <hr>
+    <a href="/orders">Ver todas las órdenes registradas (JSON)</a>
+</body>
+</html>
