@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -45,6 +49,60 @@ func initDB() {
 	}
 
 	log.Println("Base de datos de órdenes lista.")
+}
+
+// registerConsul registra este servicio en Consul
+func registerConsul() {
+	consulAddr := os.Getenv("CONSUL_ADDR")
+	if consulAddr == "" {
+		consulAddr = "consul:8500"
+	}
+
+	payload := map[string]interface{}{
+		"ID":      "order-service",
+		"Name":    "order-service",
+		"Address": "order-service",
+		"Port":    8081,
+		"Check": map[string]string{
+			"HTTP":     "http://order-service:8081/health",
+			"Interval": "10s",
+			"Timeout":  "3s",
+		},
+	}
+
+	body, _ := json.Marshal(payload)
+
+	// Reintentar hasta que Consul esté listo
+	for i := 0; i < 10; i++ {
+		req, _ := http.NewRequest(http.MethodPut, "http://"+consulAddr+"/v1/agent/service/register", bytes.NewBuffer(body))
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Do(req)
+		if err == nil && resp.StatusCode == 200 {
+			log.Println("Registrado en Consul correctamente")
+			return
+		}
+		log.Printf("Esperando Consul... intento %d/10", i+1)
+		time.Sleep(3 * time.Second)
+	}
+	log.Println("No se pudo registrar en Consul (el servicio seguirá funcionando)")
+}
+
+// deregisterConsul elimina este servicio del registry de Consul
+func deregisterConsul() {
+	consulAddr := os.Getenv("CONSUL_ADDR")
+	if consulAddr == "" {
+		consulAddr = "consul:8500"
+	}
+
+	req, _ := http.NewRequest(
+		http.MethodPut,
+		"http://"+consulAddr+"/v1/agent/service/deregister/order-service",
+		nil,
+	)
+	client := &http.Client{Timeout: 3 * time.Second}
+	client.Do(req)
+	log.Println("Desregistrado de Consul")
 }
 
 // getOrders devuelve todas las órdenes
@@ -99,6 +157,18 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	initDB()
+
+	// Registrar en Consul al iniciar
+	go registerConsul()
+
+	// Desregistrar de Consul al recibir señal de apagado
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-quit
+		deregisterConsul()
+		os.Exit(0)
+	}()
 
 	http.HandleFunc("/orders", getOrders)
 	http.HandleFunc("/orders/create", createOrder)

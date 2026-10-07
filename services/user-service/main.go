@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -98,8 +102,61 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(u)
 }
 
+func registerConsul() {
+	consulAddr := os.Getenv("CONSUL_ADDR")
+	if consulAddr == "" {
+		consulAddr = "consul:8500"
+	}
+	payload := map[string]interface{}{
+		"ID":      "user-service",
+		"Name":    "user-service",
+		"Address": "user-service",
+		"Port":    8083,
+		"Check": map[string]string{
+			"HTTP":     "http://user-service:8083/health",
+			"Interval": "10s",
+			"Timeout":  "3s",
+		},
+	}
+	body, _ := json.Marshal(payload)
+	for i := 0; i < 10; i++ {
+		req, _ := http.NewRequest(http.MethodPut, "http://"+consulAddr+"/v1/agent/service/register", bytes.NewBuffer(body))
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Do(req)
+		if err == nil && resp.StatusCode == 200 {
+			log.Println("Registrado en Consul correctamente")
+			return
+		}
+		log.Printf("Esperando Consul... intento %d/10", i+1)
+		time.Sleep(3 * time.Second)
+	}
+	log.Println("No se pudo registrar en Consul (el servicio seguirá funcionando)")
+}
+
+func deregisterConsul() {
+	consulAddr := os.Getenv("CONSUL_ADDR")
+	if consulAddr == "" {
+		consulAddr = "consul:8500"
+	}
+	req, _ := http.NewRequest(http.MethodPut, "http://"+consulAddr+"/v1/agent/service/deregister/user-service", nil)
+	client := &http.Client{Timeout: 3 * time.Second}
+	client.Do(req)
+	log.Println("Desregistrado de Consul")
+}
+
 func main() {
 	initDB()
+
+	go registerConsul()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-quit
+		deregisterConsul()
+		os.Exit(0)
+	}()
 
 	http.HandleFunc("/users", getUsers)
 	http.HandleFunc("/users/create", createUser)

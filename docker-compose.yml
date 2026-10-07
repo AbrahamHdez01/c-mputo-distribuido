@@ -26,12 +26,26 @@ services:
     networks:
       - mercado-net
 
+  # ── Consul (Service Discovery) ─────────────────────────────────────────────
+  consul:
+    image: hashicorp/consul:1.18
+    container_name: consul
+    ports:
+      - "8500:8500"     # UI y API de Consul en http://localhost:8500
+    command: agent -dev -client=0.0.0.0 -ui
+    networks:
+      - mercado-net
+
   # ── Microservicio: Órdenes ─────────────────────────────────────────────────
   order-service:
     build: ./services/order-service
     container_name: order-service
+    environment:
+      - CONSUL_ADDR=consul:8500
     volumes:
       - order-data:/data
+    depends_on:
+      - consul
     networks:
       - mercado-net
 
@@ -39,8 +53,12 @@ services:
   price-service:
     build: ./services/price-service
     container_name: price-service
+    environment:
+      - CONSUL_ADDR=consul:8500
     volumes:
       - price-data:/data
+    depends_on:
+      - consul
     networks:
       - mercado-net
 
@@ -48,8 +66,12 @@ services:
   user-service:
     build: ./services/user-service
     container_name: user-service
+    environment:
+      - CONSUL_ADDR=consul:8500
     volumes:
       - user-data:/data
+    depends_on:
+      - consul
     networks:
       - mercado-net
 
