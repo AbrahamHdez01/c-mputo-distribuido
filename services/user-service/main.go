@@ -2,17 +2,23 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	pb "user-service/proto"
+
 	_ "github.com/mattn/go-sqlite3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
 // User es la estructura de un trader registrado
@@ -50,7 +56,79 @@ func initDB() {
 	log.Println("Base de datos de usuarios lista.")
 }
 
-// getUsers devuelve todos los usuarios
+// ─── gRPC server ──────────────────────────────────────────────────────────────
+
+type userGRPCServer struct {
+	pb.UnimplementedUserServiceServer
+}
+
+func (s *userGRPCServer) ListUsers(_ context.Context, _ *pb.ListUsersRequest) (*pb.ListUsersResponse, error) {
+	rows, err := db.Query("SELECT id, name, email, balance, created_at FROM users")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []*pb.UserResponse
+	for rows.Next() {
+		var (
+			id        int
+			name      string
+			email     string
+			balance   float64
+			createdAt time.Time
+		)
+		rows.Scan(&id, &name, &email, &balance, &createdAt)
+		users = append(users, &pb.UserResponse{
+			Id:        int32(id),
+			Name:      name,
+			Email:     email,
+			Balance:   balance,
+			CreatedAt: createdAt.Format(time.RFC3339),
+		})
+	}
+	return &pb.ListUsersResponse{Users: users}, nil
+}
+
+func (s *userGRPCServer) CreateUser(_ context.Context, req *pb.CreateUserRequest) (*pb.UserResponse, error) {
+	balance := req.Balance
+	if balance == 0 {
+		balance = 10000.0
+	}
+	now := time.Now()
+	res, err := db.Exec(
+		"INSERT INTO users (name, email, balance, created_at) VALUES (?, ?, ?, ?)",
+		req.Name, req.Email, balance, now,
+	)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &pb.UserResponse{
+		Id:        int32(id),
+		Name:      req.Name,
+		Email:     req.Email,
+		Balance:   balance,
+		CreatedAt: now.Format(time.RFC3339),
+	}, nil
+}
+
+func startGRPC() {
+	lis, err := net.Listen("tcp", ":9093")
+	if err != nil {
+		log.Fatalf("gRPC listen error: %v", err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterUserServiceServer(srv, &userGRPCServer{})
+	reflection.Register(srv)
+	log.Println("user-service gRPC corriendo en :9093")
+	if err := srv.Serve(lis); err != nil {
+		log.Fatalf("gRPC serve error: %v", err)
+	}
+}
+
+// ─── HTTP handlers ────────────────────────────────────────────────────────────
+
 func getUsers(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query("SELECT id, name, email, balance, created_at FROM users")
 	if err != nil {
@@ -70,7 +148,6 @@ func getUsers(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(users)
 }
 
-// createUser registra un nuevo trader
 func createUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)
@@ -149,6 +226,7 @@ func main() {
 	initDB()
 
 	go registerConsul()
+	go startGRPC()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -164,6 +242,6 @@ func main() {
 		fmt.Fprintln(w, `{"status":"ok","service":"user-service"}`)
 	})
 
-	log.Println("user-service corriendo en :8083")
+	log.Println("user-service HTTP corriendo en :8083")
 	log.Fatal(http.ListenAndServe(":8083", nil))
 }

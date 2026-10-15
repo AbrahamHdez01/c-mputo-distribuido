@@ -36,10 +36,25 @@ services:
     networks:
       - mercado-net
 
+  # ── Go Gateway (gRPC Load Balancer) ───────────────────────────────────────
+  gateway:
+    build: ./gateway
+    container_name: gateway
+    ports:
+      - "8090:8080"   # gateway gRPC-proxy en :8090 (separado del nginx-gateway)
+    depends_on:
+      - order-service
+      - price-service
+      - user-service
+    networks:
+      - mercado-net
+
   # ── Microservicio: Órdenes ─────────────────────────────────────────────────
   order-service:
     build: ./services/order-service
     container_name: order-service
+    ports:
+      - "9091:9091"   # gRPC expuesto para grpcurl desde el host
     environment:
       - CONSUL_ADDR=consul:8500
     volumes:
@@ -53,6 +68,8 @@ services:
   price-service:
     build: ./services/price-service
     container_name: price-service
+    ports:
+      - "9092:9092"   # gRPC expuesto para grpcurl desde el host
     environment:
       - CONSUL_ADDR=consul:8500
     volumes:
@@ -66,6 +83,8 @@ services:
   user-service:
     build: ./services/user-service
     container_name: user-service
+    ports:
+      - "9093:9093"   # gRPC expuesto para grpcurl desde el host
     environment:
       - CONSUL_ADDR=consul:8500
     volumes:

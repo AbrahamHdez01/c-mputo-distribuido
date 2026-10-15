@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package market;
+
+option go_package = "market/proto";
+
+// ─── Order Service ────────────────────────────────────────────────────────────
+
+service OrderService {
+  rpc ListOrders   (ListOrdersRequest)  returns (ListOrdersResponse);
+  rpc CreateOrder  (CreateOrderRequest) returns (OrderResponse);
+}
+
+message ListOrdersRequest {}
+
+message CreateOrderRequest {
+  string symbol = 1;
+  string side   = 2;
+  double price  = 3;
+  double amount = 4;
+}
+
+message OrderResponse {
+  int32  id         = 1;
+  string symbol     = 2;
+  string side       = 3;
+  double price      = 4;
+  double amount     = 5;
+  string status     = 6;
+  string created_at = 7;
+}
+
+message ListOrdersResponse {
+  repeated OrderResponse orders = 1;
+}
+
+// ─── Price Service ────────────────────────────────────────────────────────────
+
+service PriceService {
+  rpc ListPrices (ListPricesRequest) returns (ListPricesResponse);
+}
+
+message ListPricesRequest {}
+
+message PriceResponse {
+  int32  id         = 1;
+  string symbol     = 2;
+  double price      = 3;
+  string updated_at = 4;
+}
+
+message ListPricesResponse {
+  repeated PriceResponse prices = 1;
+}
+
+// ─── User Service ─────────────────────────────────────────────────────────────
+
+service UserService {
+  rpc ListUsers  (ListUsersRequest)  returns (ListUsersResponse);
+  rpc CreateUser (CreateUserRequest) returns (UserResponse);
+}
+
+message ListUsersRequest {}
+
+message CreateUserRequest {
+  string name    = 1;
+  string email   = 2;
+  double balance = 3;
+}
+
+message UserResponse {
+  int32  id         = 1;
+  string name       = 2;
+  string email      = 3;
+  double balance    = 4;
+  string created_at = 5;
+}
+
+message ListUsersResponse {
+  repeated UserResponse users = 1;
+}

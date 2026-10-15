@@ -7,6 +7,7 @@ RUN apk add --no-cache gcc musl-dev
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
+COPY proto/ proto/
 COPY . .
 RUN CGO_ENABLED=1 GOOS=linux go build -o order-service .
 
@@ -20,5 +21,5 @@ COPY --from=builder /app/order-service .
 # Carpeta donde vivirá la base de datos SQLite
 RUN mkdir -p /data
 
-EXPOSE 8081
+EXPOSE 8081 9091
 CMD ["./order-service"]

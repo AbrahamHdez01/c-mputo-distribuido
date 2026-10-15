@@ -2,17 +2,23 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	pb "order-service/proto"
+
 	_ "github.com/mattn/go-sqlite3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
 // Order es la estructura de una orden de trading
@@ -51,7 +57,81 @@ func initDB() {
 	log.Println("Base de datos de órdenes lista.")
 }
 
-// registerConsul registra este servicio en Consul
+// ─── gRPC server ──────────────────────────────────────────────────────────────
+
+type orderGRPCServer struct {
+	pb.UnimplementedOrderServiceServer
+}
+
+func (s *orderGRPCServer) ListOrders(_ context.Context, _ *pb.ListOrdersRequest) (*pb.ListOrdersResponse, error) {
+	rows, err := db.Query("SELECT id, symbol, side, price, amount, status, created_at FROM orders")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var orders []*pb.OrderResponse
+	for rows.Next() {
+		var (
+			id        int
+			symbol    string
+			side      string
+			price     float64
+			amount    float64
+			status    string
+			createdAt time.Time
+		)
+		rows.Scan(&id, &symbol, &side, &price, &amount, &status, &createdAt)
+		orders = append(orders, &pb.OrderResponse{
+			Id:        int32(id),
+			Symbol:    symbol,
+			Side:      side,
+			Price:     price,
+			Amount:    amount,
+			Status:    status,
+			CreatedAt: createdAt.Format(time.RFC3339),
+		})
+	}
+	return &pb.ListOrdersResponse{Orders: orders}, nil
+}
+
+func (s *orderGRPCServer) CreateOrder(_ context.Context, req *pb.CreateOrderRequest) (*pb.OrderResponse, error) {
+	now := time.Now()
+	res, err := db.Exec(
+		"INSERT INTO orders (symbol, side, price, amount, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		req.Symbol, req.Side, req.Price, req.Amount, "PENDING", now,
+	)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &pb.OrderResponse{
+		Id:        int32(id),
+		Symbol:    req.Symbol,
+		Side:      req.Side,
+		Price:     req.Price,
+		Amount:    req.Amount,
+		Status:    "PENDING",
+		CreatedAt: now.Format(time.RFC3339),
+	}, nil
+}
+
+func startGRPC() {
+	lis, err := net.Listen("tcp", ":9091")
+	if err != nil {
+		log.Fatalf("gRPC listen error: %v", err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterOrderServiceServer(srv, &orderGRPCServer{})
+	reflection.Register(srv) // habilita grpcurl sin -proto flag
+	log.Println("order-service gRPC corriendo en :9091")
+	if err := srv.Serve(lis); err != nil {
+		log.Fatalf("gRPC serve error: %v", err)
+	}
+}
+
+// ─── HTTP handlers (sin cambios) ──────────────────────────────────────────────
+
 func registerConsul() {
 	consulAddr := os.Getenv("CONSUL_ADDR")
 	if consulAddr == "" {
@@ -72,7 +152,6 @@ func registerConsul() {
 
 	body, _ := json.Marshal(payload)
 
-	// Reintentar hasta que Consul esté listo
 	for i := 0; i < 10; i++ {
 		req, _ := http.NewRequest(http.MethodPut, "http://"+consulAddr+"/v1/agent/service/register", bytes.NewBuffer(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -88,7 +167,6 @@ func registerConsul() {
 	log.Println("No se pudo registrar en Consul (el servicio seguirá funcionando)")
 }
 
-// deregisterConsul elimina este servicio del registry de Consul
 func deregisterConsul() {
 	consulAddr := os.Getenv("CONSUL_ADDR")
 	if consulAddr == "" {
@@ -105,7 +183,6 @@ func deregisterConsul() {
 	log.Println("Desregistrado de Consul")
 }
 
-// getOrders devuelve todas las órdenes
 func getOrders(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query("SELECT id, symbol, side, price, amount, status, created_at FROM orders")
 	if err != nil {
@@ -125,7 +202,6 @@ func getOrders(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(orders)
 }
 
-// createOrder guarda una nueva orden en la DB
 func createOrder(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)
@@ -158,10 +234,9 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
 func main() {
 	initDB()
 
-	// Registrar en Consul al iniciar
 	go registerConsul()
+	go startGRPC()
 
-	// Desregistrar de Consul al recibir señal de apagado
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -176,6 +251,6 @@ func main() {
 		fmt.Fprintln(w, `{"status":"ok","service":"order-service"}`)
 	})
 
-	log.Println("order-service corriendo en :8081")
+	log.Println("order-service HTTP corriendo en :8081")
 	log.Fatal(http.ListenAndServe(":8081", nil))
 }

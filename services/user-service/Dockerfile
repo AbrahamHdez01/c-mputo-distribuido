@@ -6,6 +6,7 @@ RUN apk add --no-cache gcc musl-dev
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
+COPY proto/ proto/
 COPY . .
 RUN CGO_ENABLED=1 GOOS=linux go build -o user-service .
 
@@ -17,5 +18,5 @@ WORKDIR /app
 COPY --from=builder /app/user-service .
 RUN mkdir -p /data
 
-EXPOSE 8083
+EXPOSE 8083 9093
 CMD ["./user-service"]

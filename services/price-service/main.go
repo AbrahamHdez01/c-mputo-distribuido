@@ -2,18 +2,24 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	pb "price-service/proto"
+
 	_ "github.com/mattn/go-sqlite3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
 // Price guarda el precio actual de un par de monedas
@@ -26,7 +32,6 @@ type Price struct {
 
 var db *sql.DB
 
-// precios con los que arranca el sistema
 var seedPrices = map[string]float64{
 	"BTC/USD": 65000.0,
 	"ETH/USD": 3500.0,
@@ -58,7 +63,6 @@ func initDB() {
 	log.Println("Base de datos de precios lista.")
 }
 
-// simulateMarket aplica una variación aleatoria a los precios cada 5 segundos
 func simulateMarket() {
 	for {
 		time.Sleep(5 * time.Second)
@@ -79,7 +83,7 @@ func simulateMarket() {
 		rows.Close()
 
 		for _, r := range toUpdate {
-			change := (rand.Float64() - 0.5) * 0.01 // ±0.5%
+			change := (rand.Float64() - 0.5) * 0.01
 			newPrice := r.price * (1 + change)
 			db.Exec("UPDATE prices SET price = ?, updated_at = ? WHERE id = ?",
 				newPrice, time.Now(), r.id)
@@ -87,7 +91,54 @@ func simulateMarket() {
 	}
 }
 
-// getPrices devuelve los precios actuales
+// ─── gRPC server ──────────────────────────────────────────────────────────────
+
+type priceGRPCServer struct {
+	pb.UnimplementedPriceServiceServer
+}
+
+func (s *priceGRPCServer) ListPrices(_ context.Context, _ *pb.ListPricesRequest) (*pb.ListPricesResponse, error) {
+	rows, err := db.Query("SELECT id, symbol, price, updated_at FROM prices")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var prices []*pb.PriceResponse
+	for rows.Next() {
+		var (
+			id        int
+			symbol    string
+			price     float64
+			updatedAt time.Time
+		)
+		rows.Scan(&id, &symbol, &price, &updatedAt)
+		prices = append(prices, &pb.PriceResponse{
+			Id:        int32(id),
+			Symbol:    symbol,
+			Price:     price,
+			UpdatedAt: updatedAt.Format(time.RFC3339),
+		})
+	}
+	return &pb.ListPricesResponse{Prices: prices}, nil
+}
+
+func startGRPC() {
+	lis, err := net.Listen("tcp", ":9092")
+	if err != nil {
+		log.Fatalf("gRPC listen error: %v", err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterPriceServiceServer(srv, &priceGRPCServer{})
+	reflection.Register(srv)
+	log.Println("price-service gRPC corriendo en :9092")
+	if err := srv.Serve(lis); err != nil {
+		log.Fatalf("gRPC serve error: %v", err)
+	}
+}
+
+// ─── HTTP handlers ────────────────────────────────────────────────────────────
+
 func getPrices(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query("SELECT id, symbol, price, updated_at FROM prices")
 	if err != nil {
@@ -155,6 +206,7 @@ func main() {
 
 	go simulateMarket()
 	go registerConsul()
+	go startGRPC()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -169,6 +221,6 @@ func main() {
 		fmt.Fprintln(w, `{"status":"ok","service":"price-service"}`)
 	})
 
-	log.Println("price-service corriendo en :8082")
+	log.Println("price-service HTTP corriendo en :8082")
 	log.Fatal(http.ListenAndServe(":8082", nil))
 }
