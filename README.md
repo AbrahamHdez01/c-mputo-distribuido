@@ -43,6 +43,30 @@ Sistema distribuido que simula un mercado financiero usando microservicios con D
 └──────────────────────────────────────────────────────────────┘
 ```
 
+### Capa asíncrona (Apache Kafka)
+
+Lo de arriba es **comunicación síncrona**: alguien pide y espera respuesta.
+Kafka agrega la **comunicación asíncrona**: el servicio publica un evento y
+sigue trabajando; quien le interese lo consume después, por su cuenta.
+
+```
+  order-service ──publica──→ [ orders.created ]───→ (notif-orders)  ┐
+  order-service ──publica──→ [ orders.filled  ]───→ (notif-fills)   │
+  user-service  ──publica──→ [ users.registered]──→ (notif-users)   ├─→ notification-service
+                                                                    │      (bitácora
+  price-service ──publica──→ [ prices.updated ]───→ (notif-prices)  ┘      de eventos)
+                                    │
+                                    └────────────→ (order-matcher) ──→ order-service
+                                                                        completa órdenes
+                                                                        PENDING → FILLED
+
+      [ tópico ]  = canal de mensajes        (nadie los borra al leerlos)
+      (cola)      = consumer group de Kafka  (cada uno con su propio avance)
+```
+
+El price-service **no sabe que el order-service existe**: solo publica precios.
+Y aun así las órdenes se completan solas. Eso es el desacoplamiento.
+
 ---
 
 ## Estructura del proyecto
@@ -75,19 +99,34 @@ simulador-mercado/
     ├── order-service/          ← Contenedor 4: Órdenes (HTTP :8081 + gRPC :9091)
     │   ├── Dockerfile
     │   ├── go.mod / go.sum
-    │   ├── main.go
+    │   ├── main.go             ← + matching asíncrono (consume prices.updated)
+    │   ├── events.go           ← Capa de Kafka (productor + consumidor)
     │   └── proto/
     ├── price-service/          ← Contenedor 5: Precios  (HTTP :8082 + gRPC :9092)
     │   ├── Dockerfile
     │   ├── go.mod / go.sum
-    │   ├── main.go
+    │   ├── main.go             ← + publica cada tick en prices.updated
+    │   ├── events.go
     │   └── proto/
-    └── user-service/           ← Contenedor 6: Usuarios (HTTP :8083 + gRPC :9093)
+    ├── user-service/           ← Contenedor 6: Usuarios (HTTP :8083 + gRPC :9093)
+    │   ├── Dockerfile
+    │   ├── go.mod / go.sum
+    │   ├── main.go             ← + publica en users.registered
+    │   ├── events.go
+    │   └── proto/
+    └── notification-service/   ← Contenedor 7: Consumidor Kafka (HTTP :8084)
         ├── Dockerfile
         ├── go.mod / go.sum
-        ├── main.go
-        └── proto/
+        ├── main.go             ← 4 colas + bitácora de eventos en SQLite
+        └── events.go
 ```
+
+Contenedores de infraestructura que agrega Kafka: `kafka` (broker),
+`kafka-init` (crea los tópicos y se apaga) y `kafka-ui` (interfaz web).
+
+> **Nota:** `events.go` es **el mismo archivo copiado** en los cuatro
+> servicios, igual que la carpeta `proto/`. Así cada microservicio compila
+> solo, sin depender de los demás.
 
 ---
 
@@ -125,6 +164,10 @@ docker compose down
 | **Service Discovery** | http://localhost:8080/services |
 | **gRPC Status** | http://localhost:8090/grpc/status |
 | **Consul UI** | http://localhost:8500 |
+| **Bitácora de eventos** | http://localhost:8080/events |
+| **Stats por tópico** | http://localhost:8080/events/stats |
+| **Kafka UI** | http://localhost:8085 |
+| **Kafka (desde el host)** | localhost:9094 |
 
 Los microservicios solo son accesibles desde dentro de la red Docker (por alguno de los gateways).
 
@@ -139,6 +182,10 @@ Los microservicios solo son accesibles desde dentro de la red Docker (por alguno
 | GET | /prices | Precios actuales |
 | GET | /users | Lista traders |
 | POST | /users/create | Registra un trader |
+| GET | /events | Bitácora de eventos de Kafka (últimos 100) |
+| GET | /events?topic=prices.updated | Filtra por tópico |
+| GET | /events?limit=10 | Limita la cantidad |
+| GET | /events/stats | Cuántos mensajes consumió cada cola |
 | GET | /health | Estado del gateway |
 | GET | /services | Servicios registrados |
 
@@ -458,6 +505,462 @@ curl -s http://localhost:8090/grpc/status
 
 ---
 
+---
+
+## Apache Kafka — Cola de mensajería asíncrona
+
+### Tópicos vs. colas (lo que más se confunde)
+
+En Kafka **el tópico no es la cola**:
+
+| | Tópico | Cola (consumer group) |
+|---|---|---|
+| Qué es | El canal donde se publican los mensajes | El grupo que lee ese canal |
+| ¿Se borran los mensajes al leerlos? | **No**, el tópico es append-only | No borra nada; solo avanza su *offset* |
+| ¿Dos lectores se pelean los mensajes? | — | **No** si son grupos distintos: cada grupo lleva su propio avance |
+| Ejemplo aquí | `prices.updated` | `order-matcher` y `notif-prices` |
+
+Por eso `prices.updated` lo leen **dos colas al mismo tiempo** y las dos reciben
+todos los mensajes: `order-matcher` para completar órdenes y `notif-prices`
+para guardarlos en la bitácora. Si en cambio levantáramos **dos instancias del
+mismo grupo**, entonces sí se repartirían los mensajes entre ellas (una por
+partición) — eso es escalar un consumidor.
+
+### Tópicos implementados
+
+Cada servicio publica en el tópico que le corresponde:
+
+| Tópico | Productor | Cuándo se publica | Key (define la partición) |
+|---|---|---|---|
+| `orders.created` | order-service | Al crear una orden (por HTTP y por gRPC) | símbolo (`BTC/USD`) |
+| `orders.filled` | order-service | Cuando el matching completa una orden | símbolo |
+| `prices.updated` | price-service | Cada 5 s, un mensaje por par de monedas | símbolo |
+| `users.registered` | user-service | Al registrar un trader | email |
+
+Los cuatro se crean con **3 particiones** y factor de replicación 1
+(un solo broker). La *key* decide la partición: todos los eventos de `BTC/USD`
+caen en la misma, así que **nunca se desordenan entre sí**.
+
+### Colas implementadas (consumer groups)
+
+| Cola | Servicio que la corre | Tópico que consume | Qué hace con el mensaje |
+|---|---|---|---|
+| `order-matcher` | order-service | `prices.updated` | Completa órdenes PENDING → FILLED |
+| `notif-orders` | notification-service | `orders.created` | La guarda en la bitácora |
+| `notif-fills` | notification-service | `orders.filled` | La guarda en la bitácora |
+| `notif-prices` | notification-service | `prices.updated` | La guarda en la bitácora |
+| `notif-users` | notification-service | `users.registered` | La guarda en la bitácora |
+
+### El formato de los mensajes
+
+Todos los mensajes usan el mismo "sobre", así cualquier consumidor puede leer
+cualquier tópico sin conocer el detalle:
+
+```json
+{
+  "topic": "orders.created",
+  "service": "order-service",
+  "timestamp": "2026-10-23T22:14:03.512Z",
+  "payload": {
+    "id": 7,
+    "symbol": "BTC/USD",
+    "side": "SELL",
+    "price": 65200.0,
+    "amount": 0.5,
+    "status": "PENDING",
+    "created_at": "2026-10-23T22:14:03Z"
+  }
+}
+```
+
+### La implementación — `events.go`
+
+El archivo está copiado igual en los 4 servicios (misma idea que `proto/`).
+Tiene tres piezas:
+
+**1. El productor** — uno por servicio, compartido por todos los handlers:
+
+```go
+kafkaWriter = &kafka.Writer{
+    Addr:         kafka.TCP(brokers()...),
+    Balancer:     &kafka.Hash{},        // misma key → misma partición → orden garantizado
+    RequiredAcks: kafka.RequireOne,     // esperamos la confirmación del broker
+    BatchTimeout: 10 * time.Millisecond,
+    AllowAutoTopicCreation: true,       // red de seguridad
+}
+```
+
+**2. Publicar** — envuelve el dato en un `Event` y lo manda:
+
+```go
+publishEvent(TopicOrdersCreated, order.Symbol, order)
+```
+
+Si Kafka está caído, `publishEvent` solo escribe el error en el log: **el
+servicio no falla**. Crear una orden sigue funcionando. Eso es justamente la
+ventaja de la mensajería asíncrona sobre una llamada directa.
+
+**3. Consumir** — una función arranca una cola en segundo plano:
+
+```go
+startConsumer(GroupOrderMatcher, TopicPricesUpdated, onPriceUpdated)
+```
+
+`ReadMessage` confirma el offset automáticamente, así que si el contenedor se
+reinicia **retoma la lectura donde se quedó** en vez de reprocesar todo.
+
+### El matching asíncrono (la parte interesante)
+
+El `order-service` es productor **y** consumidor. Consume `prices.updated` y
+completa las órdenes que el mercado ya alcanzó:
+
+```go
+// una BUY  se completa si el mercado bajó hasta su precio o menos
+// una SELL se completa si el mercado subió hasta su precio o más
+UPDATE orders SET status = 'FILLED'
+ WHERE status = 'PENDING' AND symbol = ?
+   AND ((side = 'BUY' AND price >= ?) OR (side = 'SELL' AND price <= ?))
+```
+
+Nadie llama a esta función: se dispara sola con cada mensaje de Kafka. Y cuando
+completa una orden, **publica un evento nuevo** (`orders.filled`), que a su vez
+otra cola consume. Esa es la cadena de eventos.
+
+---
+
+## Pruebas de Kafka
+
+### TEST 14 — Ver los tópicos creados
+
+```bash
+docker exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --list
+```
+
+**Resultado:**
+```
+__consumer_offsets
+orders.created
+orders.filled
+prices.updated
+users.registered
+```
+
+> `__consumer_offsets` es un tópico interno de Kafka: ahí guarda el avance
+> (offset) de cada cola. No lo creamos nosotros.
+
+---
+
+### TEST 15 — Describir un tópico (particiones y réplicas)
+
+```bash
+docker exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic prices.updated
+```
+
+**Resultado:**
+```
+Topic: prices.updated  PartitionCount: 3  ReplicationFactor: 1
+  Topic: prices.updated  Partition: 0  Leader: 1  Replicas: 1  Isr: 1
+  Topic: prices.updated  Partition: 1  Leader: 1  Replicas: 1  Isr: 1
+  Topic: prices.updated  Partition: 2  Leader: 1  Replicas: 1  Isr: 1
+```
+
+---
+
+### TEST 16 — Ver los mensajes en vivo (console consumer)
+
+Deja esto corriendo y verás un mensaje nuevo cada 5 segundos:
+
+```bash
+docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic prices.updated --from-beginning
+```
+
+**Resultado:**
+```json
+{"topic":"prices.updated","service":"price-service","timestamp":"2026-10-23T23:05:25.682704886Z","payload":{"price":166.5901876289965,"symbol":"SOL/USD","updated_at":"2026-10-23T23:05:25.678648678Z"}}
+{"topic":"prices.updated","service":"price-service","timestamp":"2026-10-23T23:05:25.704284803Z","payload":{"price":78494.31950636879,"symbol":"BTC/USD","updated_at":"2026-10-23T23:05:25.697233928Z"}}
+{"topic":"prices.updated","service":"price-service","timestamp":"2026-10-23T23:05:25.721194511Z","payload":{"price":4248.318684893078,"symbol":"ETH/USD","updated_at":"2026-10-23T23:05:25.716527803Z"}}
+```
+
+Y un mensaje de `orders.created`:
+
+```bash
+docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic orders.created --from-beginning --max-messages 1
+```
+
+```json
+{"topic":"orders.created","service":"order-service","timestamp":"2026-10-23T22:58:25.535073511Z","payload":{"id":7,"symbol":"BTC/USD","side":"SELL","price":82016.62,"amount":0.5,"status":"PENDING","created_at":"2026-10-23T22:58:25.531788803Z"}}
+```
+
+> Sal con `Ctrl+C`. Ojo: este comando crea su propia cola temporal, así que
+> **no le quita mensajes** a `order-matcher` ni a `notif-prices`.
+
+---
+
+### TEST 17 — Ver las colas y su retraso (lag)
+
+```bash
+docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --list
+```
+
+**Resultado:**
+```
+order-matcher
+notif-orders
+notif-fills
+notif-prices
+notif-users
+```
+
+Y el detalle de una cola:
+
+```bash
+docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group order-matcher
+```
+
+**Resultado** (recortado: el comando también imprime CONSUMER-ID, HOST y CLIENT-ID):
+```
+GROUP          TOPIC           PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+order-matcher  prices.updated  0          82              82              0
+order-matcher  prices.updated  1          82              82              0
+order-matcher  prices.updated  2          82              82              0
+```
+
+El CLIENT-ID confirma quién es el consumidor:
+`order-service@29110d75d145 (github.com/segmentio/kafka-go)`
+
+`LAG 0` significa que la cola va al día. Si apagas el order-service un rato y
+lo vuelves a prender, verás el LAG subir y luego bajar: **los mensajes se
+quedaron esperando en el tópico**. Eso es lo que hace una cola de mensajería.
+
+---
+
+### TEST 18 — La bitácora de eventos (consumidor en acción)
+
+```bash
+curl -s http://localhost:8080/events/stats
+```
+
+**Resultado:**
+```json
+[
+  { "topic": "orders.created",   "total": 3,   "last_event": "2026-10-23 23:03:03.535097596+00:00" },
+  { "topic": "orders.filled",    "total": 4,   "last_event": "2026-10-23 23:03:04.874208589+00:00" },
+  { "topic": "prices.updated",   "total": 186, "last_event": "2026-10-23 23:03:04.923938425+00:00" },
+  { "topic": "users.registered", "total": 1,   "last_event": "2026-10-23 23:03:02.887322375+00:00" }
+]
+```
+
+> Un tópico solo aparece aquí cuando ya recibió al menos un mensaje. Si acabas
+> de levantar el sistema, `users.registered` no saldrá hasta que registres un
+> trader.
+
+Y los últimos eventos de un tópico:
+
+```bash
+curl -s "http://localhost:8080/events?topic=orders.created&limit=2"
+```
+
+**Resultado:**
+```json
+[
+  {
+    "id": 179,
+    "topic": "orders.created",
+    "service": "order-service",
+    "time": "2026-10-23T23:02:29.535097596Z",
+    "payload": { "id": 8, "symbol": "BTC/USD", "side": "SELL", "price": 79859.01, "amount": 0.5, "status": "PENDING", "created_at": "2026-10-23T23:02:29.531788803Z" }
+  }
+]
+```
+
+---
+
+### TEST 19 — Demostrar el flujo asíncrono completo
+
+Este es **el test que prueba que la cola funciona de punta a punta**.
+
+1. Mira el precio actual de BTC:
+
+```bash
+curl -s http://localhost:8080/prices
+```
+
+2. Crea una orden SELL **un poco por debajo** del precio de mercado. Al estar
+   debajo, el mercado ya la alcanzó, así que el matching la completará en el
+   próximo mensaje de Kafka (≤ 5 s):
+
+```bash
+# si el mercado está en 79938, usa algo como 79859
+curl -s -X POST http://localhost:8080/orders/create \
+  -H "Content-Type: application/json" \
+  -d '{"symbol":"BTC/USD","side":"SELL","price":79859.01,"amount":0.5}'
+```
+
+**Resultado:**
+```json
+{"id":8,"symbol":"BTC/USD","side":"SELL","price":79859.01,"amount":0.5,"status":"PENDING","created_at":"..."}
+```
+
+Fíjate bien: el gateway respondió **`PENDING`**. El matching **no ocurre
+dentro de la petición HTTP** — ese es justamente el punto.
+
+3. Espera unos segundos **sin hacer nada** y vuelve a consultar:
+
+```bash
+curl -s http://localhost:8080/orders
+```
+
+**Resultado:** la orden ahora dice `"status": "FILLED"`. Nadie llamó a ningún
+endpoint para cambiarla: la completó la cola `order-matcher` al recibir un
+precio nuevo por Kafka.
+
+4. Compruébalo en el log:
+
+```bash
+docker compose logs order-service | grep -E "matching|orders.filled"
+```
+
+**Resultado:**
+```
+order-service | [kafka] ← order-matcher recibió de prices.updated (partición 1, offset 72)
+order-service | [matching] orden #8 SELL BTC/USD @ 79859.01 completada (mercado 79945.16)
+order-service | [kafka] → publicado en orders.filled (key=BTC/USD)
+```
+
+Y la cadena sigue: ese `orders.filled` lo recibe la cola `notif-fills`:
+
+```bash
+docker compose logs notification-service | grep notif-fills
+```
+
+```
+notification-service | [kafka] ← notif-fills recibió de orders.filled (partición 1, offset 0)
+notification-service | [notificaciones] evento de orders.filled guardado (order-service)
+```
+
+> **Variante: una orden que se queda esperando.** Si en el paso 2 pones el
+> precio **arriba** del mercado (ej. 0.15 % más), la orden se queda en PENDING
+> hasta que el mercado suba lo suficiente. Como el precio se mueve al azar
+> (±0.5 % por tick), eso puede tardar minutos o no pasar en un buen rato: es
+> una orden en reposo, igual que en un mercado real.
+
+---
+
+### TEST 20 — Kafka UI (interfaz web)
+
+Abre **http://localhost:8085**
+
+Ahí se ve, sin usar la terminal:
+
+- **Topics** → los 4 tópicos, con sus particiones y cuántos mensajes tiene cada uno
+- **Topics → prices.updated → Messages** → el contenido JSON de cada mensaje
+- **Consumers** → las 5 colas, qué tópico lee cada una y su LAG en tiempo real
+
+Es la forma más clara de ver, de un vistazo, que los tópicos y las colas están
+funcionando.
+
+---
+
+### TEST 21 — Qué pasa si Kafka se cae
+
+Esto demuestra la ventaja real de la mensajería asíncrona frente a una llamada
+directa entre servicios.
+
+1. Apaga el broker:
+
+```bash
+docker compose stop kafka
+```
+
+2. Crea una orden con Kafka caído:
+
+```bash
+curl -s -w "\nHTTP %{http_code}\n" -X POST http://localhost:8080/orders/create \
+  -H "Content-Type: application/json" \
+  -d '{"symbol":"SOL/USD","side":"BUY","price":200,"amount":1}'
+```
+
+**Resultado:**
+```json
+{"id":10,"symbol":"SOL/USD","side":"BUY","price":200,"amount":1,"status":"PENDING","created_at":"..."}
+HTTP 201
+```
+
+**El servicio siguió funcionando.** Las lecturas (`/orders`, `/prices`) y los
+endpoints gRPC (`/grpc/users`) también responden 200. Lo único que pasa es un
+error en el log:
+
+```
+[kafka] error publicando en orders.created: Kafka write errors (1/1), errors:
+  [kafka.(*Client).Produce: dial tcp: lookup kafka on 127.0.0.11:53: no such host]
+```
+
+Si en vez de Kafka el order-service llamara al price-service por HTTP y ese
+estuviera caído, la petición del usuario **fallaría**. Con la cola, no.
+
+3. Préndelo otra vez:
+
+```bash
+docker compose start kafka
+```
+
+Los consumidores **se reconectan solos** (kafka-go reintenta), consumen lo que
+se acumuló y el LAG vuelve a 0. La orden #10 se completa en cuanto llega el
+primer precio nuevo:
+
+```
+[matching] orden #10 BUY SOL/USD @ 200.00 completada (mercado 168.70)
+```
+
+Mientras los consumidores se reconectan se puede ver el LAG subir:
+
+```
+notif-prices  prices.updated  0  67  72  LAG=5
+```
+
+y bajar a 0 unos segundos después. **Ese LAG es la cola haciendo su trabajo:**
+los mensajes esperaron en el tópico hasta que hubo quién los leyera.
+
+> **Límite honesto de esta implementación:** el evento que no se pudo publicar
+> mientras Kafka estaba caído **se perdió** (la orden sí quedó guardada en
+> SQLite, pero su `orders.created` nunca llegó a la bitácora). Para no perderlo
+> habría que guardar el evento en la misma base de datos junto con la orden y
+> publicarlo después — eso es el patrón **Transactional Outbox**, que queda
+> fuera del alcance de esta práctica.
+
+---
+
+### Notas de implementación
+
+- **El broker es efímero:** no le pusimos volumen, así que `docker compose down`
+  borra los mensajes. La bitácora del notification-service **sí persiste**
+  (tiene su volumen `notification-data`). Para que Kafka también persista
+  bastaría agregarle un volumen en `/var/lib/kafka/data` y apuntar ahí
+  `KAFKA_LOG_DIRS`.
+- **Orden de arranque:** los servicios tienen
+  `depends_on: kafka-init: service_completed_successfully`, así que Docker no
+  los levanta hasta que los 4 tópicos existen. Por eso el primer
+  `docker compose up` tarda más: espera el healthcheck de Kafka.
+- **Si Kafka se cae**, los microservicios siguen respondiendo HTTP y gRPC con
+  normalidad; solo dejan de publicar eventos (y lo dicen en el log).
+  Ver el TEST 21.
+- **El `prices.updated` genera muchos eventos** (3 mensajes cada 5 s, ~2,160
+  por hora). Por eso `/events` devuelve solo los últimos 100 por defecto y
+  acepta `?topic=` para filtrar.
+- **Por qué `segmentio/kafka-go` y no el cliente de Confluent:** kafka-go es Go
+  puro. El de Confluent necesita la librería de C `librdkafka`, que habría
+  obligado a cambiar los Dockerfiles de Alpine.
+
+---
+
 ## Nginx Gateway — configuración
 
 El archivo [`nginx-gateway/nginx.conf`](nginx-gateway/nginx.conf) tiene dos partes:
@@ -504,15 +1007,24 @@ location /users {
 | Load Balancer Round Robin gRPC | `grpcPool.next()` en gateway/main.go |
 | Database per Service | Cada servicio con su propio SQLite aislado |
 | Server Reflection | `reflection.Register` en cada servidor gRPC |
+| Publish / Subscribe | Tópicos de Kafka en `events.go` |
+| Message Queue | Consumer groups (`order-matcher`, `notif-*`) |
+| Event-Driven Architecture | El matching se dispara por un evento, no por una petición |
+| Event Log / Bitácora | notification-service guarda todos los eventos |
+| Competing Consumers | 3 particiones por tópico: se puede escalar el consumidor |
 
 ---
 
 ## Tecnologías
 
 - **Go 1.22** — microservicios backend + gateway gRPC
-- **gRPC + Protobuf** — comunicación binaria entre servicios
+- **gRPC + Protobuf** — comunicación binaria síncrona entre servicios
+- **Apache Kafka 3.7 (modo KRaft)** — cola de mensajería asíncrona
+- **segmentio/kafka-go** — cliente de Kafka en Go puro (sin dependencias de C)
+- **Kafka UI** — interfaz web para ver tópicos, mensajes y colas
 - **SQLite** — base de datos por servicio
 - **Nginx** — frontend + gateway HTTP/reverse proxy/load balancer
 - **Docker + Docker Compose** — contenedores y orquestación
 - **Consul** — service discovery
 - **grpcurl** — cliente gRPC de línea de comandos para pruebas
+- **kafka-topics.sh / kafka-console-consumer.sh** — CLI de Kafka para pruebas

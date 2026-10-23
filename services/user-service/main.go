@@ -104,6 +104,16 @@ func (s *userGRPCServer) CreateUser(_ context.Context, req *pb.CreateUserRequest
 		return nil, err
 	}
 	id, _ := res.LastInsertId()
+
+	// Kafka: avisamos que se registró un trader nuevo.
+	publishEvent(TopicUsersRegistered, req.Email, User{
+		ID:        int(id),
+		Name:      req.Name,
+		Email:     req.Email,
+		Balance:   balance,
+		CreatedAt: now,
+	})
+
 	return &pb.UserResponse{
 		Id:        int32(id),
 		Name:      req.Name,
@@ -174,6 +184,9 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 	id, _ := res.LastInsertId()
 	u.ID = int(id)
 
+	// Kafka: mismo evento que en el camino gRPC.
+	publishEvent(TopicUsersRegistered, u.Email, u)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(u)
@@ -224,6 +237,9 @@ func deregisterConsul() {
 
 func main() {
 	initDB()
+
+	// Kafka: este servicio solo produce (publica en users.registered).
+	initKafka("user-service")
 
 	go registerConsul()
 	go startGRPC()

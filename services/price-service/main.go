@@ -85,8 +85,17 @@ func simulateMarket() {
 		for _, r := range toUpdate {
 			change := (rand.Float64() - 0.5) * 0.01
 			newPrice := r.price * (1 + change)
+			now := time.Now()
 			db.Exec("UPDATE prices SET price = ?, updated_at = ? WHERE id = ?",
-				newPrice, time.Now(), r.id)
+				newPrice, now, r.id)
+
+			// Kafka: cada precio nuevo es un evento. Un mensaje por símbolo,
+			// con el símbolo como key para que no se desordenen entre sí.
+			publishEvent(TopicPricesUpdated, r.symbol, map[string]interface{}{
+				"symbol":     r.symbol,
+				"price":      newPrice,
+				"updated_at": now,
+			})
 		}
 	}
 }
@@ -203,6 +212,9 @@ func deregisterConsul() {
 
 func main() {
 	initDB()
+
+	// Kafka: este servicio solo produce (publica en prices.updated).
+	initKafka("price-service")
 
 	go simulateMarket()
 	go registerConsul()

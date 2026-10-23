@@ -105,6 +105,20 @@ func (s *orderGRPCServer) CreateOrder(_ context.Context, req *pb.CreateOrderRequ
 		return nil, err
 	}
 	id, _ := res.LastInsertId()
+
+	order := Order{
+		ID:        int(id),
+		Symbol:    req.Symbol,
+		Side:      req.Side,
+		Price:     req.Price,
+		Amount:    req.Amount,
+		Status:    "PENDING",
+		CreatedAt: now,
+	}
+
+	// Kafka: avisamos al resto del sistema que entró una orden nueva.
+	publishEvent(TopicOrdersCreated, order.Symbol, order)
+
 	return &pb.OrderResponse{
 		Id:        int32(id),
 		Symbol:    req.Symbol,
@@ -114,6 +128,75 @@ func (s *orderGRPCServer) CreateOrder(_ context.Context, req *pb.CreateOrderRequ
 		Status:    "PENDING",
 		CreatedAt: now.Format(time.RFC3339),
 	}, nil
+}
+
+// ─── Matching asíncrono (consumidor de prices.updated) ────────────────────────
+//
+// Nadie llama esta función por HTTP ni por gRPC: se dispara sola cada vez que
+// el price-service publica un precio nuevo en Kafka. Eso es el desacoplamiento:
+// el price-service no sabe que el order-service existe.
+
+// onPriceUpdated se ejecuta con cada mensaje de la cola 'order-matcher'.
+func onPriceUpdated(ev Event) {
+	var p struct {
+		Symbol string  `json:"symbol"`
+		Price  float64 `json:"price"`
+	}
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		log.Printf("[matching] payload inválido: %v", err)
+		return
+	}
+	matchOrders(p.Symbol, p.Price)
+}
+
+// matchOrders completa las órdenes PENDING que el precio de mercado ya alcanzó:
+//   • una orden BUY  se completa si el mercado bajó hasta su precio o menos
+//   • una orden SELL se completa si el mercado subió hasta su precio o más
+func matchOrders(symbol string, marketPrice float64) {
+	rows, err := db.Query(`SELECT id, side, price, amount FROM orders
+		WHERE status = 'PENDING' AND symbol = ?
+		  AND ((side = 'BUY' AND price >= ?) OR (side = 'SELL' AND price <= ?))`,
+		symbol, marketPrice, marketPrice)
+	if err != nil {
+		log.Printf("[matching] error buscando órdenes: %v", err)
+		return
+	}
+
+	// Juntamos primero y actualizamos después: SQLite no deja escribir
+	// mientras un SELECT sigue abierto.
+	type pending struct {
+		id     int
+		side   string
+		price  float64
+		amount float64
+	}
+	var matched []pending
+	for rows.Next() {
+		var o pending
+		rows.Scan(&o.id, &o.side, &o.price, &o.amount)
+		matched = append(matched, o)
+	}
+	rows.Close()
+
+	for _, o := range matched {
+		if _, err := db.Exec("UPDATE orders SET status = 'FILLED' WHERE id = ?", o.id); err != nil {
+			log.Printf("[matching] error actualizando orden #%d: %v", o.id, err)
+			continue
+		}
+
+		log.Printf("[matching] orden #%d %s %s @ %.2f completada (mercado %.2f)",
+			o.id, o.side, symbol, o.price, marketPrice)
+
+		// El resultado del matching también es un evento: lo publicamos.
+		publishEvent(TopicOrdersFilled, symbol, map[string]interface{}{
+			"id":           o.id,
+			"symbol":       symbol,
+			"side":         o.side,
+			"order_price":  o.price,
+			"market_price": marketPrice,
+			"amount":       o.amount,
+		})
+	}
 }
 
 func startGRPC() {
@@ -226,6 +309,9 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
 	id, _ := res.LastInsertId()
 	o.ID = int(id)
 
+	// Kafka: mismo evento que en el camino gRPC.
+	publishEvent(TopicOrdersCreated, o.Symbol, o)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(o)
@@ -233,6 +319,10 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	initDB()
+
+	// Kafka: productor + la cola que escucha los precios para hacer matching.
+	initKafka("order-service")
+	startConsumer(GroupOrderMatcher, TopicPricesUpdated, onPriceUpdated)
 
 	go registerConsul()
 	go startGRPC()
