@@ -16,8 +16,9 @@ import (
 
 	pb "order-service/proto"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/lib/pq"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -34,27 +35,30 @@ type Order struct {
 
 var db *sql.DB
 
+// hostname identifica a ESTA réplica (en Docker es el id corto del contenedor).
+var hostname, _ = os.Hostname()
+
+// withInstance agrega el header X-Instance para ver qué réplica contestó.
+func withInstance(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Instance", hostname)
+		h(w, r)
+	}
+}
+
+// initDB se conecta a la base de datos ÚNICA (PostgreSQL) compartida por todas
+// las réplicas. Las tablas las crea db/init.sql, no el servicio.
 func initDB() {
 	var err error
-	db, err = sql.Open("sqlite3", "/data/orders.db")
+	db, err = sql.Open("postgres", os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatal("Error abriendo la base de datos:", err)
 	}
-
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS orders (
-		id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		symbol     TEXT    NOT NULL,
-		side       TEXT    NOT NULL,
-		price      REAL    NOT NULL,
-		amount     REAL    NOT NULL,
-		status     TEXT    NOT NULL DEFAULT 'PENDING',
-		created_at DATETIME NOT NULL
-	)`)
-	if err != nil {
-		log.Fatal("Error creando tabla orders:", err)
+	if err = db.Ping(); err != nil {
+		log.Fatal("No se pudo conectar a PostgreSQL:", err)
 	}
 
-	log.Println("Base de datos de órdenes lista.")
+	log.Printf("Conectado a PostgreSQL (réplica %s).", hostname)
 }
 
 // ─── gRPC server ──────────────────────────────────────────────────────────────
@@ -97,14 +101,14 @@ func (s *orderGRPCServer) ListOrders(_ context.Context, _ *pb.ListOrdersRequest)
 
 func (s *orderGRPCServer) CreateOrder(_ context.Context, req *pb.CreateOrderRequest) (*pb.OrderResponse, error) {
 	now := time.Now()
-	res, err := db.Exec(
-		"INSERT INTO orders (symbol, side, price, amount, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+	var id int
+	err := db.QueryRow(
+		"INSERT INTO orders (symbol, side, price, amount, status, created_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
 		req.Symbol, req.Side, req.Price, req.Amount, "PENDING", now,
-	)
+	).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
-	id, _ := res.LastInsertId()
 
 	order := Order{
 		ID:        int(id),
@@ -152,18 +156,20 @@ func onPriceUpdated(ev Event) {
 // matchOrders completa las órdenes PENDING que el precio de mercado ya alcanzó:
 //   • una orden BUY  se completa si el mercado bajó hasta su precio o menos
 //   • una orden SELL se completa si el mercado subió hasta su precio o más
+//
+// Con varias réplicas, el UPDATE ... RETURNING es atómico: si dos réplicas
+// intentan completar la misma orden, solo una la recibe de vuelta.
 func matchOrders(symbol string, marketPrice float64) {
-	rows, err := db.Query(`SELECT id, side, price, amount FROM orders
-		WHERE status = 'PENDING' AND symbol = ?
-		  AND ((side = 'BUY' AND price >= ?) OR (side = 'SELL' AND price <= ?))`,
-		symbol, marketPrice, marketPrice)
+	rows, err := db.Query(`UPDATE orders SET status = 'FILLED'
+		WHERE status = 'PENDING' AND symbol = $1
+		  AND ((side = 'BUY' AND price >= $2) OR (side = 'SELL' AND price <= $2))
+		RETURNING id, side, price, amount`,
+		symbol, marketPrice)
 	if err != nil {
-		log.Printf("[matching] error buscando órdenes: %v", err)
+		log.Printf("[matching] error completando órdenes: %v", err)
 		return
 	}
 
-	// Juntamos primero y actualizamos después: SQLite no deja escribir
-	// mientras un SELECT sigue abierto.
 	type pending struct {
 		id     int
 		side   string
@@ -179,11 +185,6 @@ func matchOrders(symbol string, marketPrice float64) {
 	rows.Close()
 
 	for _, o := range matched {
-		if _, err := db.Exec("UPDATE orders SET status = 'FILLED' WHERE id = ?", o.id); err != nil {
-			log.Printf("[matching] error actualizando orden #%d: %v", o.id, err)
-			continue
-		}
-
 		log.Printf("[matching] orden #%d %s %s @ %.2f completada (mercado %.2f)",
 			o.id, o.side, symbol, o.price, marketPrice)
 
@@ -199,12 +200,19 @@ func matchOrders(symbol string, marketPrice float64) {
 	}
 }
 
+// instanceInterceptor manda el hostname de la réplica en un header gRPC,
+// para que el gateway pueda mostrar quién atendió la llamada.
+func instanceInterceptor(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (interface{}, error) {
+	grpc.SetHeader(ctx, metadata.Pairs("x-instance", hostname))
+	return h(ctx, req)
+}
+
 func startGRPC() {
 	lis, err := net.Listen("tcp", ":9091")
 	if err != nil {
 		log.Fatalf("gRPC listen error: %v", err)
 	}
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(grpc.UnaryInterceptor(instanceInterceptor))
 	pb.RegisterOrderServiceServer(srv, &orderGRPCServer{})
 	reflection.Register(srv) // habilita grpcurl sin -proto flag
 	log.Println("order-service gRPC corriendo en :9091")
@@ -221,13 +229,14 @@ func registerConsul() {
 		consulAddr = "consul:8500"
 	}
 
+	// Un ID distinto por réplica; si no, la segunda pisaría el registro de la primera.
 	payload := map[string]interface{}{
-		"ID":      "order-service",
+		"ID":      "order-service-" + hostname,
 		"Name":    "order-service",
-		"Address": "order-service",
+		"Address": hostname,
 		"Port":    8081,
 		"Check": map[string]string{
-			"HTTP":     "http://order-service:8081/health",
+			"HTTP":     "http://" + hostname + ":8081/health",
 			"Interval": "10s",
 			"Timeout":  "3s",
 		},
@@ -258,7 +267,7 @@ func deregisterConsul() {
 
 	req, _ := http.NewRequest(
 		http.MethodPut,
-		"http://"+consulAddr+"/v1/agent/service/deregister/order-service",
+		"http://"+consulAddr+"/v1/agent/service/deregister/order-service-"+hostname,
 		nil,
 	)
 	client := &http.Client{Timeout: 3 * time.Second}
@@ -299,15 +308,12 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
 	o.Status = "PENDING"
 	o.CreatedAt = time.Now()
 
-	res, err := db.Exec("INSERT INTO orders (symbol, side, price, amount, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-		o.Symbol, o.Side, o.Price, o.Amount, o.Status, o.CreatedAt)
+	err := db.QueryRow("INSERT INTO orders (symbol, side, price, amount, status, created_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+		o.Symbol, o.Side, o.Price, o.Amount, o.Status, o.CreatedAt).Scan(&o.ID)
 	if err != nil {
 		http.Error(w, "Error guardando orden", http.StatusInternalServerError)
 		return
 	}
-
-	id, _ := res.LastInsertId()
-	o.ID = int(id)
 
 	// Kafka: mismo evento que en el camino gRPC.
 	publishEvent(TopicOrdersCreated, o.Symbol, o)
@@ -335,11 +341,11 @@ func main() {
 		os.Exit(0)
 	}()
 
-	http.HandleFunc("/orders", getOrders)
-	http.HandleFunc("/orders/create", createOrder)
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/orders", withInstance(getOrders))
+	http.HandleFunc("/orders/create", withInstance(createOrder))
+	http.HandleFunc("/health", withInstance(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, `{"status":"ok","service":"order-service"}`)
-	})
+	}))
 
 	log.Println("order-service HTTP corriendo en :8081")
 	log.Fatal(http.ListenAndServe(":8081", nil))

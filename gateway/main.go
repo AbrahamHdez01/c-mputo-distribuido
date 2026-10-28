@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 // ─── HTTP Load Balancer (Round Robin) ─────────────────────────────────────────
@@ -136,195 +138,132 @@ func services(w http.ResponseWriter, r *http.Request) {
 
 // ─── gRPC Load Balancer (Round Robin) ─────────────────────────────────────────
 
-// grpcPool maneja los endpoints gRPC de un servicio con round robin
-type grpcPool struct {
-	addrs   []string
-	counter uint64
+// grpcTargets: nombre DNS de cada servicio. En Docker, el nombre resuelve a las
+// IPs de TODAS las réplicas, y gRPC con round_robin reparte las llamadas entre
+// ellas (una conexión persistente por servicio, no una por petición).
+var grpcTargets = map[string]string{
+	"order-service": "order-service:9091",
+	"price-service": "price-service:9092",
+	"user-service":  "user-service:9093",
 }
 
-func (p *grpcPool) next() string {
-	idx := atomic.AddUint64(&p.counter, 1) % uint64(len(p.addrs))
-	return p.addrs[idx]
-}
+var grpcConns = map[string]*grpc.ClientConn{}
 
-var grpcRegistry = map[string]*grpcPool{
-	"order-service": {addrs: []string{"order-service:9091"}},
-	"price-service": {addrs: []string{"price-service:9092"}},
-	"user-service":  {addrs: []string{"user-service:9093"}},
-}
+const roundRobin = `{"loadBalancingConfig":[{"round_robin":{}}]}`
 
-func dialGRPC(addr string) (*grpc.ClientConn, error) {
-	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-}
-
-// grpcOrders — lista órdenes vía gRPC
-func grpcOrders(w http.ResponseWriter, r *http.Request) {
-	addr := grpcRegistry["order-service"].next()
-	log.Printf("[gateway] gRPC ListOrders → %s", addr)
-
-	conn, err := dialGRPC(addr)
-	if err != nil {
-		http.Error(w, "gRPC connection error: "+err.Error(), http.StatusBadGateway)
-		return
+func initGRPC() {
+	for name, target := range grpcTargets {
+		conn, err := grpc.NewClient("dns:///"+target,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultServiceConfig(roundRobin))
+		if err != nil {
+			log.Fatalf("[gateway] no se pudo crear el cliente gRPC de %s: %v", name, err)
+		}
+		grpcConns[name] = conn
 	}
-	defer conn.Close()
+}
+
+// callGRPC ejecuta una llamada gRPC y responde en JSON. X-Served-By lleva el
+// hostname de la réplica que atendió (lo manda el servidor en el header gRPC
+// "x-instance"), así se ve el reparto entre réplicas.
+func callGRPC(w http.ResponseWriter, service string, okStatus int,
+	call func(ctx context.Context, conn *grpc.ClientConn, opts ...grpc.CallOption) (interface{}, error)) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := pb.NewOrderServiceClient(conn).ListOrders(ctx, &pb.ListOrdersRequest{})
+	var hdr metadata.MD
+	out, err := call(ctx, grpcConns[service], grpc.Header(&hdr))
 	if err != nil {
 		http.Error(w, "gRPC error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 
+	instance := "desconocida"
+	if v := hdr.Get("x-instance"); len(v) > 0 {
+		instance = v[0]
+	}
+	log.Printf("[gateway] gRPC %s → atendió %s", service, instance)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Transport", "grpc")
-	w.Header().Set("X-Served-By", addr)
-	json.NewEncoder(w).Encode(resp.Orders)
+	w.Header().Set("X-Served-By", instance)
+	w.WriteHeader(okStatus)
+	json.NewEncoder(w).Encode(out)
 }
 
-// grpcCreateOrder — crea orden vía gRPC
+func grpcOrders(w http.ResponseWriter, r *http.Request) {
+	callGRPC(w, "order-service", http.StatusOK, func(ctx context.Context, conn *grpc.ClientConn, opts ...grpc.CallOption) (interface{}, error) {
+		resp, err := pb.NewOrderServiceClient(conn).ListOrders(ctx, &pb.ListOrdersRequest{}, opts...)
+		if err != nil {
+			return nil, err
+		}
+		return resp.Orders, nil
+	})
+}
+
 func grpcCreateOrder(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)
 		return
 	}
-
 	var req pb.CreateOrderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "JSON inválido", http.StatusBadRequest)
 		return
 	}
-
-	addr := grpcRegistry["order-service"].next()
-	log.Printf("[gateway] gRPC CreateOrder → %s", addr)
-
-	conn, err := dialGRPC(addr)
-	if err != nil {
-		http.Error(w, "gRPC connection error: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer conn.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	resp, err := pb.NewOrderServiceClient(conn).CreateOrder(ctx, &req)
-	if err != nil {
-		http.Error(w, "gRPC error: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Transport", "grpc")
-	w.Header().Set("X-Served-By", addr)
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(resp)
+	callGRPC(w, "order-service", http.StatusCreated, func(ctx context.Context, conn *grpc.ClientConn, opts ...grpc.CallOption) (interface{}, error) {
+		return pb.NewOrderServiceClient(conn).CreateOrder(ctx, &req, opts...)
+	})
 }
 
-// grpcPrices — lista precios vía gRPC
 func grpcPrices(w http.ResponseWriter, r *http.Request) {
-	addr := grpcRegistry["price-service"].next()
-	log.Printf("[gateway] gRPC ListPrices → %s", addr)
-
-	conn, err := dialGRPC(addr)
-	if err != nil {
-		http.Error(w, "gRPC connection error: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer conn.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	resp, err := pb.NewPriceServiceClient(conn).ListPrices(ctx, &pb.ListPricesRequest{})
-	if err != nil {
-		http.Error(w, "gRPC error: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Transport", "grpc")
-	w.Header().Set("X-Served-By", addr)
-	json.NewEncoder(w).Encode(resp.Prices)
+	callGRPC(w, "price-service", http.StatusOK, func(ctx context.Context, conn *grpc.ClientConn, opts ...grpc.CallOption) (interface{}, error) {
+		resp, err := pb.NewPriceServiceClient(conn).ListPrices(ctx, &pb.ListPricesRequest{}, opts...)
+		if err != nil {
+			return nil, err
+		}
+		return resp.Prices, nil
+	})
 }
 
-// grpcUsers — lista usuarios vía gRPC
 func grpcUsers(w http.ResponseWriter, r *http.Request) {
-	addr := grpcRegistry["user-service"].next()
-	log.Printf("[gateway] gRPC ListUsers → %s", addr)
-
-	conn, err := dialGRPC(addr)
-	if err != nil {
-		http.Error(w, "gRPC connection error: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer conn.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	resp, err := pb.NewUserServiceClient(conn).ListUsers(ctx, &pb.ListUsersRequest{})
-	if err != nil {
-		http.Error(w, "gRPC error: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Transport", "grpc")
-	w.Header().Set("X-Served-By", addr)
-	json.NewEncoder(w).Encode(resp.Users)
+	callGRPC(w, "user-service", http.StatusOK, func(ctx context.Context, conn *grpc.ClientConn, opts ...grpc.CallOption) (interface{}, error) {
+		resp, err := pb.NewUserServiceClient(conn).ListUsers(ctx, &pb.ListUsersRequest{}, opts...)
+		if err != nil {
+			return nil, err
+		}
+		return resp.Users, nil
+	})
 }
 
-// grpcCreateUser — crea usuario vía gRPC
 func grpcCreateUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)
 		return
 	}
-
 	var req pb.CreateUserRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "JSON inválido", http.StatusBadRequest)
 		return
 	}
-
-	addr := grpcRegistry["user-service"].next()
-	log.Printf("[gateway] gRPC CreateUser → %s", addr)
-
-	conn, err := dialGRPC(addr)
-	if err != nil {
-		http.Error(w, "gRPC connection error: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer conn.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	resp, err := pb.NewUserServiceClient(conn).CreateUser(ctx, &req)
-	if err != nil {
-		http.Error(w, "gRPC error: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Transport", "grpc")
-	w.Header().Set("X-Served-By", addr)
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(resp)
+	callGRPC(w, "user-service", http.StatusCreated, func(ctx context.Context, conn *grpc.ClientConn, opts ...grpc.CallOption) (interface{}, error) {
+		return pb.NewUserServiceClient(conn).CreateUser(ctx, &req, opts...)
+	})
 }
 
-// grpcStatus — muestra el registro gRPC con sus endpoints
+// grpcStatus — resuelve el DNS de cada servicio y muestra las IPs de sus réplicas
 func grpcStatus(w http.ResponseWriter, r *http.Request) {
 	type GRPCInfo struct {
-		Service string   `json:"service"`
-		Addrs   []string `json:"addrs"`
+		Service  string   `json:"service"`
+		Target   string   `json:"target"`
+		Replicas []string `json:"replicas"`
 	}
 	result := []GRPCInfo{}
-	for name, pool := range grpcRegistry {
-		result = append(result, GRPCInfo{Service: name, Addrs: pool.addrs})
+	for name, target := range grpcTargets {
+		host, _, _ := net.SplitHostPort(target)
+		ips, _ := net.LookupHost(host)
+		result = append(result, GRPCInfo{Service: name, Target: target, Replicas: ips})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
@@ -333,6 +272,8 @@ func grpcStatus(w http.ResponseWriter, r *http.Request) {
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 func main() {
+	initGRPC()
+
 	// ── rutas HTTP proxy (transporte original) ──
 	http.HandleFunc("/orders", route)
 	http.HandleFunc("/orders/", route)

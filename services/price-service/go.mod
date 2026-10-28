@@ -3,7 +3,7 @@ module price-service
 go 1.22
 
 require (
-	github.com/mattn/go-sqlite3 v1.14.22
+	github.com/lib/pq v1.10.9
 	github.com/segmentio/kafka-go v0.4.47
 	google.golang.org/grpc v1.64.0
 	google.golang.org/protobuf v1.34.2

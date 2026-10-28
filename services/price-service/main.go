@@ -17,8 +17,9 @@ import (
 
 	pb "price-service/proto"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/lib/pq"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -32,62 +33,75 @@ type Price struct {
 
 var db *sql.DB
 
-var seedPrices = map[string]float64{
-	"BTC/USD": 65000.0,
-	"ETH/USD": 3500.0,
-	"SOL/USD": 180.0,
+// hostname identifica a ESTA réplica (en Docker es el id corto del contenedor).
+var hostname, _ = os.Hostname()
+
+// withInstance agrega el header X-Instance para ver qué réplica contestó.
+func withInstance(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Instance", hostname)
+		h(w, r)
+	}
 }
 
+// initDB se conecta a la base de datos ÚNICA (PostgreSQL) compartida por todas
+// las réplicas. Las tablas y los precios iniciales los crea db/init.sql.
 func initDB() {
 	var err error
-	db, err = sql.Open("sqlite3", "/data/prices.db")
+	db, err = sql.Open("postgres", os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatal("Error abriendo la base de datos:", err)
 	}
-
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS prices (
-		id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		symbol     TEXT    NOT NULL UNIQUE,
-		price      REAL    NOT NULL,
-		updated_at DATETIME NOT NULL
-	)`)
-	if err != nil {
-		log.Fatal("Error creando tabla prices:", err)
+	if err = db.Ping(); err != nil {
+		log.Fatal("No se pudo conectar a PostgreSQL:", err)
 	}
 
-	for symbol, price := range seedPrices {
-		db.Exec(`INSERT OR IGNORE INTO prices (symbol, price, updated_at) VALUES (?, ?, ?)`,
-			symbol, price, time.Now())
-	}
-
-	log.Println("Base de datos de precios lista.")
+	log.Printf("Conectado a PostgreSQL (réplica %s).", hostname)
 }
 
+// simulateMarket mueve los precios cada ~5 s.
+//
+// Con 3 réplicas corriendo este mismo bucle, los precios se moverían 3 veces
+// por tick. Para evitarlo, el UPDATE solo aplica si el precio no se movió en
+// los últimos 4 s: la primera réplica que llega gana el tick, y a las demás
+// el UPDATE les devuelve 0 filas (no hacen nada ni publican nada).
 func simulateMarket() {
 	for {
 		time.Sleep(5 * time.Second)
-		rows, _ := db.Query("SELECT id, symbol, price FROM prices")
-		defer rows.Close()
 
+		rows, err := db.Query("SELECT id, symbol FROM prices")
+		if err != nil {
+			log.Printf("[mercado] error leyendo precios: %v", err)
+			continue
+		}
 		type row struct {
 			id     int
 			symbol string
-			price  float64
 		}
-		var toUpdate []row
+		var all []row
 		for rows.Next() {
 			var r row
-			rows.Scan(&r.id, &r.symbol, &r.price)
-			toUpdate = append(toUpdate, r)
+			rows.Scan(&r.id, &r.symbol)
+			all = append(all, r)
 		}
 		rows.Close()
 
-		for _, r := range toUpdate {
-			change := (rand.Float64() - 0.5) * 0.01
-			newPrice := r.price * (1 + change)
+		for _, r := range all {
+			change := (rand.Float64() - 0.5) * 0.01 // ±0.5 %
 			now := time.Now()
-			db.Exec("UPDATE prices SET price = ?, updated_at = ? WHERE id = ?",
-				newPrice, now, r.id)
+
+			var newPrice float64
+			err := db.QueryRow(`UPDATE prices
+				SET price = price * (1 + $1::float8), updated_at = $2::timestamptz
+				WHERE id = $3 AND updated_at < $2::timestamptz - interval '4 seconds'
+				RETURNING price`, change, now, r.id).Scan(&newPrice)
+			if err == sql.ErrNoRows {
+				continue // otra réplica ya movió este precio en este tick
+			}
+			if err != nil {
+				log.Printf("[mercado] error actualizando %s: %v", r.symbol, err)
+				continue
+			}
 
 			// Kafka: cada precio nuevo es un evento. Un mensaje por símbolo,
 			// con el símbolo como key para que no se desordenen entre sí.
@@ -132,12 +146,19 @@ func (s *priceGRPCServer) ListPrices(_ context.Context, _ *pb.ListPricesRequest)
 	return &pb.ListPricesResponse{Prices: prices}, nil
 }
 
+// instanceInterceptor manda el hostname de la réplica en un header gRPC,
+// para que el gateway pueda mostrar quién atendió la llamada.
+func instanceInterceptor(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (interface{}, error) {
+	grpc.SetHeader(ctx, metadata.Pairs("x-instance", hostname))
+	return h(ctx, req)
+}
+
 func startGRPC() {
 	lis, err := net.Listen("tcp", ":9092")
 	if err != nil {
 		log.Fatalf("gRPC listen error: %v", err)
 	}
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(grpc.UnaryInterceptor(instanceInterceptor))
 	pb.RegisterPriceServiceServer(srv, &priceGRPCServer{})
 	reflection.Register(srv)
 	log.Println("price-service gRPC corriendo en :9092")
@@ -173,12 +194,12 @@ func registerConsul() {
 		consulAddr = "consul:8500"
 	}
 	payload := map[string]interface{}{
-		"ID":      "price-service",
+		"ID":      "price-service-" + hostname,
 		"Name":    "price-service",
-		"Address": "price-service",
+		"Address": hostname,
 		"Port":    8082,
 		"Check": map[string]string{
-			"HTTP":     "http://price-service:8082/health",
+			"HTTP":     "http://" + hostname + ":8082/health",
 			"Interval": "10s",
 			"Timeout":  "3s",
 		},
@@ -204,7 +225,7 @@ func deregisterConsul() {
 	if consulAddr == "" {
 		consulAddr = "consul:8500"
 	}
-	req, _ := http.NewRequest(http.MethodPut, "http://"+consulAddr+"/v1/agent/service/deregister/price-service", nil)
+	req, _ := http.NewRequest(http.MethodPut, "http://"+consulAddr+"/v1/agent/service/deregister/price-service-"+hostname, nil)
 	client := &http.Client{Timeout: 3 * time.Second}
 	client.Do(req)
 	log.Println("Desregistrado de Consul")
@@ -228,10 +249,10 @@ func main() {
 		os.Exit(0)
 	}()
 
-	http.HandleFunc("/prices", getPrices)
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/prices", withInstance(getPrices))
+	http.HandleFunc("/health", withInstance(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, `{"status":"ok","service":"price-service"}`)
-	})
+	}))
 
 	log.Println("price-service HTTP corriendo en :8082")
 	log.Fatal(http.ListenAndServe(":8082", nil))

@@ -17,11 +17,17 @@ services:
     container_name: nginx-gateway
     ports:
       - "8080:8080"
+    # Esperamos a que las 3 réplicas de cada backend estén sanas: nginx resuelve
+    # el DNS UNA vez al arrancar, y si arranca antes se queda con una sola IP.
     depends_on:
-      - order-service
-      - price-service
-      - user-service
-      - notification-service
+      order-service:
+        condition: service_healthy
+      price-service:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_started
     networks:
       - mercado-net
 
@@ -118,24 +124,63 @@ services:
     ports:
       - "8090:8080"   # gateway gRPC-proxy en :8090 (separado del nginx-gateway)
     depends_on:
-      - order-service
-      - price-service
-      - user-service
+      order-service:
+        condition: service_healthy
+      price-service:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
     networks:
       - mercado-net
+
+  # ── PostgreSQL (la DB ÚNICA del diagrama) ──────────────────────────────────
+  # Las 9 réplicas de los backends apuntan a esta misma base. El esquema y los
+  # datos semilla los crea db/init.sql la primera vez que arranca el volumen.
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: mercado
+      POSTGRES_PASSWORD: mercado
+      POSTGRES_DB: mercado
+    ports:
+      - "5432:5432"     # para inspeccionar con psql desde el host
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mercado -d mercado"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - mercado-net
+
+  # ── Backends: 3 réplicas de cada uno (el "x3" del diagrama) ────────────────
+  # Sin container_name (Docker no permite nombres repetidos). El nombre del
+  # servicio resuelve por DNS a las 3 IPs, y ahí reparten NGINX / el gateway.
+  # Los puertos son un RANGO: cada réplica toma uno, para probarlas con grpcurl.
 
   # ── Microservicio: Órdenes ─────────────────────────────────────────────────
   order-service:
     build: ./services/order-service
-    container_name: order-service
+    deploy:
+      replicas: 3
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/health >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
     ports:
-      - "9091:9091"   # gRPC expuesto para grpcurl desde el host
+      - "9101-9103:9091"   # gRPC de cada réplica, desde el host
     environment:
       - CONSUL_ADDR=consul:8500
       - KAFKA_BROKERS=kafka:9092
-    volumes:
-      - order-data:/data
+      - DATABASE_URL=postgres://mercado:mercado@postgres:5432/mercado?sslmode=disable
     depends_on:
+      postgres:
+        condition: service_healthy
       consul:
         condition: service_started
       kafka-init:
@@ -146,15 +191,23 @@ services:
   # ── Microservicio: Precios ─────────────────────────────────────────────────
   price-service:
     build: ./services/price-service
-    container_name: price-service
+    deploy:
+      replicas: 3
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/health >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
     ports:
-      - "9092:9092"   # gRPC expuesto para grpcurl desde el host
+      - "9111-9113:9092"   # gRPC de cada réplica, desde el host
     environment:
       - CONSUL_ADDR=consul:8500
       - KAFKA_BROKERS=kafka:9092
-    volumes:
-      - price-data:/data
+      - DATABASE_URL=postgres://mercado:mercado@postgres:5432/mercado?sslmode=disable
     depends_on:
+      postgres:
+        condition: service_healthy
       consul:
         condition: service_started
       kafka-init:
@@ -165,15 +218,23 @@ services:
   # ── Microservicio: Usuarios ────────────────────────────────────────────────
   user-service:
     build: ./services/user-service
-    container_name: user-service
+    deploy:
+      replicas: 3
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8083/health >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
     ports:
-      - "9093:9093"   # gRPC expuesto para grpcurl desde el host
+      - "9121-9123:9093"   # gRPC de cada réplica, desde el host
     environment:
       - CONSUL_ADDR=consul:8500
       - KAFKA_BROKERS=kafka:9092
-    volumes:
-      - user-data:/data
+      - DATABASE_URL=postgres://mercado:mercado@postgres:5432/mercado?sslmode=disable
     depends_on:
+      postgres:
+        condition: service_healthy
       consul:
         condition: service_started
       kafka-init:
@@ -207,7 +268,5 @@ networks:
 
 # ── Volúmenes persistentes para las bases de datos ────────────────────────
 volumes:
-  order-data:
-  price-data:
-  user-data:
+  pg-data:
   notification-data:

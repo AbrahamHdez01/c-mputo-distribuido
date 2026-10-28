@@ -7,41 +7,39 @@ Sistema distribuido que simula un mercado financiero usando microservicios con D
 
 ## Arquitectura
 
+Es la topología del pizarrón: **F → MLB → (BA, BB, BC) ×3 → DB**.
+
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  USUARIO (navegador)                                          │
-└─────────────────────┬────────────────────────────────────────┘
-                      │ http://localhost:3000
-                      ▼
-┌──────────────────────────────────────────────────────────────┐
-│  FRONTEND  (Nginx — puerto 3000)                             │
-│  index.html — interfaz web con JS puro                       │
-└─────────────────────┬────────────────────────────────────────┘
-                      │ http://localhost:8080
-                      ▼
-┌──────────────────────────────────────────────────────────────┐
-│  NGINX GATEWAY  (Nginx — puerto 8080)                        │
-│  • Reverse Proxy  • Load Balancer HTTP Round Robin           │
-└──────┬──────────────┬──────────────────┬─────────────────────┘
-       │ HTTP         │ HTTP             │ HTTP
-       ▼              ▼                  ▼
-  ┌──────────┐  ┌───────────┐  ┌─────────────┐
-  │  order   │  │   price   │  │    user     │
-  │ service  │  │  service  │  │   service   │
-  │ :8081    │  │   :8082   │  │    :8083    │
-  │ gRPC9091 │  │  gRPC9092 │  │  gRPC9093  │
-  │  SQLite  │  │   SQLite  │  │   SQLite    │
-  └──────────┘  └───────────┘  └─────────────┘
-       ▲              ▲                  ▲
-       │ gRPC         │ gRPC             │ gRPC
-       └──────────────┴──────────────────┘
-                      │
-┌──────────────────────────────────────────────────────────────┐
-│  GO GATEWAY  (puerto 8090)                                   │
-│  • gRPC Client Round Robin Load Balancer                     │
-│  • HTTP→gRPC proxy (/grpc/*)                                 │
-└──────────────────────────────────────────────────────────────┘
+                                        ┌─► order-service  ×3 ─┐
+                                        │   (HTTP 8081 / gRPC 9091)
+┌─────────┐   ┌──────────────────┐      │                      │
+│ Frontend│──►│ MLB (middleware  │──────┼─► price-service  ×3 ─┼──►  ┌────────────┐
+│  :3000  │   │ load balancer)   │      │   (HTTP 8082 / gRPC 9092)  │ PostgreSQL │
+└─────────┘   │ NGINX :8080  HTTP│      │                      │     │  (DB única)│
+              │ Go GW :8090  gRPC│      └─► user-service   ×3 ─┘     └────────────┘
+              └──────────────────┘          (HTTP 8083 / gRPC 9093)
 ```
+
+| Pieza del pizarrón | En el proyecto | Instancias |
+|---|---|---|
+| **F** (frontend) | `frontend` (Nginx, :3000) | 1 |
+| **MLB** (middleware load balancer) | `nginx-gateway` (HTTP, :8080) y `gateway` Go (gRPC, :8090) | 1 + 1 |
+| **BA** | `order-service` | **3** |
+| **BB** | `price-service` | **3** |
+| **BC** | `user-service` | **3** |
+| **DB** (una sola) | `postgres` | 1 |
+
+**9 backends** = 3 servicios × 3 réplicas, todos apuntando a **la misma base de datos**.
+
+Cómo reparte cada MLB entre las 3 réplicas:
+
+- **HTTP (NGINX):** el `upstream` apunta al nombre del servicio. El DNS de Docker devuelve
+  las 3 IPs y NGINX las reparte en round robin (`zone` para que lo hagan parejo los workers).
+- **gRPC (Go Gateway):** mantiene **una conexión persistente por servicio** con la política
+  `round_robin` sobre DNS (`dns:///order-service:9091`) y reparte *cada llamada* entre las 3 réplicas.
+
+Todas las respuestas indican quién atendió: `X-Instance` (hostname de la réplica, HTTP),
+`X-Upstream` (IP:puerto que eligió NGINX) y `X-Served-By` (réplica que atendió el gRPC).
 
 ### Capa asíncrona (Apache Kafka)
 
@@ -76,6 +74,9 @@ simulador-mercado/
 ├── docker-compose.yml
 ├── setup.sh
 │
+├── db/
+│   └── init.sql                ← Esquema + datos semilla de PostgreSQL (se ejecuta 1 vez)
+│
 ├── proto/                      ← Definición Protobuf compartida
 │   ├── market.proto            ← Contrato gRPC de los 3 servicios
 │   ├── market.pb.go            ← Generado por protoc
@@ -96,19 +97,19 @@ simulador-mercado/
 │   └── proto/                  ← Copia del código generado
 │
 └── services/
-    ├── order-service/          ← Contenedor 4: Órdenes (HTTP :8081 + gRPC :9091)
+    ├── order-service/          ← Contenedor 4: Órdenes ×3 (HTTP :8081 + gRPC :9091)
     │   ├── Dockerfile
     │   ├── go.mod / go.sum
     │   ├── main.go             ← + matching asíncrono (consume prices.updated)
     │   ├── events.go           ← Capa de Kafka (productor + consumidor)
     │   └── proto/
-    ├── price-service/          ← Contenedor 5: Precios  (HTTP :8082 + gRPC :9092)
+    ├── price-service/          ← Contenedor 5: Precios  ×3 (HTTP :8082 + gRPC :9092)
     │   ├── Dockerfile
     │   ├── go.mod / go.sum
     │   ├── main.go             ← + publica cada tick en prices.updated
     │   ├── events.go
     │   └── proto/
-    ├── user-service/           ← Contenedor 6: Usuarios (HTTP :8083 + gRPC :9093)
+    ├── user-service/           ← Contenedor 6: Usuarios ×3 (HTTP :8083 + gRPC :9093)
     │   ├── Dockerfile
     │   ├── go.mod / go.sum
     │   ├── main.go             ← + publica en users.registered
@@ -117,7 +118,7 @@ simulador-mercado/
     └── notification-service/   ← Contenedor 7: Consumidor Kafka (HTTP :8084)
         ├── Dockerfile
         ├── go.mod / go.sum
-        ├── main.go             ← 4 colas + bitácora de eventos en SQLite
+        ├── main.go             ← 4 colas + bitácora de eventos (SQLite propio, 1 instancia)
         └── events.go
 ```
 
@@ -229,11 +230,11 @@ service UserService {
 
 ### Puertos gRPC
 
-| Servicio | Puerto HTTP | Puerto gRPC |
-|---|---|---|
-| order-service | 8081 | **9091** |
-| price-service | 8082 | **9092** |
-| user-service | 8083 | **9093** |
+| Servicio | Puerto HTTP | Puerto gRPC (red Docker) | gRPC desde el host (una por réplica) |
+|---|---|---|---|
+| order-service | 8081 | 9091 | **9101, 9102, 9103** |
+| price-service | 8082 | 9092 | **9111, 9112, 9113** |
+| user-service | 8083 | 9093 | **9121, 9122, 9123** |
 
 ### Server Reflection
 
@@ -242,18 +243,18 @@ Todos los servidores registran `reflection.Register(srv)` lo que permite usar
 
 ### Load Balancer gRPC en el Gateway
 
-El Go Gateway implementa un round-robin independiente para los endpoints gRPC:
+El Go Gateway abre **una conexión persistente por servicio** con la política `round_robin`
+resolviendo el nombre por DNS. Docker devuelve las IPs de las 3 réplicas y gRPC reparte
+**cada llamada** entre ellas:
 
 ```go
-var grpcRegistry = map[string]*grpcPool{
-    "order-service": {addrs: []string{"order-service:9091"}},
-    "price-service": {addrs: []string{"price-service:9092"}},
-    "user-service":  {addrs: []string{"user-service:9093"}},
-}
+conn, _ := grpc.NewClient("dns:///order-service:9091",
+    grpc.WithTransportCredentials(insecure.NewCredentials()),
+    grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`))
 ```
 
-Para escalar un servicio basta con agregar más entradas al slice `addrs` —
-el round robin distribuirá las peticiones automáticamente.
+Cada servidor manda su hostname en el header gRPC `x-instance` (un *interceptor*), y el gateway
+lo devuelve como `X-Served-By`. Para escalar basta con `docker compose up -d --scale order-service=5`.
 
 ---
 
@@ -270,7 +271,7 @@ brew install grpcurl
 ### TEST 1 — Listar servicios disponibles (reflection)
 
 ```bash
-grpcurl -plaintext localhost:9091 list
+grpcurl -plaintext localhost:9101 list
 ```
 
 **Resultado:**
@@ -285,7 +286,7 @@ market.OrderService
 ### TEST 2 — Listar métodos de OrderService
 
 ```bash
-grpcurl -plaintext localhost:9091 list market.OrderService
+grpcurl -plaintext localhost:9101 list market.OrderService
 ```
 
 **Resultado:**
@@ -299,7 +300,7 @@ market.OrderService.ListOrders
 ### TEST 3 — Listar métodos de PriceService
 
 ```bash
-grpcurl -plaintext localhost:9092 list market.PriceService
+grpcurl -plaintext localhost:9111 list market.PriceService
 ```
 
 **Resultado:**
@@ -312,7 +313,7 @@ market.PriceService.ListPrices
 ### TEST 4 — Listar métodos de UserService
 
 ```bash
-grpcurl -plaintext localhost:9093 list market.UserService
+grpcurl -plaintext localhost:9121 list market.UserService
 ```
 
 **Resultado:**
@@ -326,7 +327,7 @@ market.UserService.ListUsers
 ### TEST 5 — ListOrders
 
 ```bash
-grpcurl -plaintext localhost:9091 market.OrderService.ListOrders
+grpcurl -plaintext localhost:9101 market.OrderService.ListOrders
 ```
 
 **Resultado:**
@@ -353,7 +354,7 @@ grpcurl -plaintext localhost:9091 market.OrderService.ListOrders
 ```bash
 grpcurl -plaintext \
   -d '{"symbol":"ETH/USD","side":"BUY","price":3500.0,"amount":2.5}' \
-  localhost:9091 market.OrderService.CreateOrder
+  localhost:9101 market.OrderService.CreateOrder
 ```
 
 **Resultado:**
@@ -374,7 +375,7 @@ grpcurl -plaintext \
 ### TEST 7 — ListPrices
 
 ```bash
-grpcurl -plaintext localhost:9092 market.PriceService.ListPrices
+grpcurl -plaintext localhost:9111 market.PriceService.ListPrices
 ```
 
 **Resultado:**
@@ -393,7 +394,7 @@ grpcurl -plaintext localhost:9092 market.PriceService.ListPrices
 ### TEST 8 — ListUsers
 
 ```bash
-grpcurl -plaintext localhost:9093 market.UserService.ListUsers
+grpcurl -plaintext localhost:9121 market.UserService.ListUsers
 ```
 
 **Resultado:**
@@ -412,7 +413,7 @@ grpcurl -plaintext localhost:9093 market.UserService.ListUsers
 ```bash
 grpcurl -plaintext \
   -d '{"name":"Alice gRPC","email":"alice@grpc.test","balance":50000.0}' \
-  localhost:9093 market.UserService.CreateUser
+  localhost:9121 market.UserService.CreateUser
 ```
 
 **Resultado:**
@@ -431,7 +432,7 @@ grpcurl -plaintext \
 ### TEST 10 — Describe schema de un mensaje
 
 ```bash
-grpcurl -plaintext localhost:9091 describe market.CreateOrderRequest
+grpcurl -plaintext localhost:9101 describe market.CreateOrderRequest
 ```
 
 **Resultado:**
@@ -461,7 +462,7 @@ curl -s http://localhost:8090/grpc/prices
   { "id": 3, "symbol": "ETH/USD", "price": 4232.60, "updated_at": "2026-10-15T00:17:03Z" }
 ]
 ```
-*(Headers respuesta incluyen `X-Transport: grpc` y `X-Served-By: price-service:9092`)*
+*(Headers respuesta incluyen `X-Transport: grpc` y `X-Served-By: <hostname de la réplica>`)*
 
 ---
 
@@ -488,18 +489,18 @@ curl -s -X POST http://localhost:8090/grpc/orders/create \
 
 ---
 
-### TEST 13 — gRPC Status del Gateway
+### TEST 13 — gRPC Status del Gateway (IPs de las réplicas)
 
 ```bash
 curl -s http://localhost:8090/grpc/status
 ```
 
-**Resultado:**
+**Resultado:** el gateway resuelve el DNS y ve **3 IPs por servicio**:
 ```json
 [
-  { "service": "order-service", "addrs": ["order-service:9091"] },
-  { "service": "price-service", "addrs": ["price-service:9092"] },
-  { "service": "user-service",  "addrs": ["user-service:9093"]  }
+  { "service": "order-service", "target": "order-service:9091", "replicas": ["172.19.0.8", "172.19.0.14", "172.19.0.11"] },
+  { "service": "price-service", "target": "price-service:9092", "replicas": ["172.19.0.9", "172.19.0.15", "172.19.0.12"] },
+  { "service": "user-service",  "target": "user-service:9093",  "replicas": ["172.19.0.5", "172.19.0.13", "172.19.0.10"] }
 ]
 ```
 
@@ -961,6 +962,121 @@ los mensajes esperaron en el tópico hasta que hubo quién los leyera.
 
 ---
 
+## Balanceo con 9 backends y base de datos única
+
+Esta sección responde al diagrama del pizarrón: **3 réplicas de cada backend (BA, BB, BC)
+detrás del load balancer, todas apuntando a una sola DB.**
+
+### Qué cambió y por qué
+
+| Problema al tener 3 réplicas | Solución |
+|---|---|
+| `container_name` fijo (Docker no permite nombres repetidos) | Se quitó; el **nombre del servicio** resuelve por DNS a las 3 IPs |
+| Puertos fijos del host chocan | Rangos: `9101-9103`, `9111-9113`, `9121-9123` |
+| SQLite es un archivo: 9 contenedores escribiendo se bloquean | **PostgreSQL** como DB única (`db/init.sql` crea el esquema una vez) |
+| Todas se registraban en Consul con el mismo ID y se pisaban | ID = `<servicio>-<hostname>` (9 registros distintos) |
+| 3 réplicas de `simulateMarket()` moverían el precio ×3 | `UPDATE … WHERE updated_at < now - 4 s … RETURNING`: solo una réplica gana cada tick |
+| 3 réplicas del matching podrían completar la misma orden dos veces | `UPDATE … SET status='FILLED' … RETURNING`: atómico, solo una la recibe |
+| NGINX resuelve el DNS **una sola vez** al arrancar | `healthcheck` en cada backend + `depends_on: service_healthy` para que NGINX arranque con las 3 IPs |
+| Workers de NGINX repartían desparejo (10-1-1) | `zone` en cada `upstream` (estado compartido entre workers) |
+
+### TEST 22 — Los 9 backends están arriba
+
+```bash
+docker compose ps --format "table {{.Name}}\t{{.Status}}" | grep service
+```
+
+**Resultado:**
+```
+simulador-mercado-order-service-1   Up (healthy)
+simulador-mercado-order-service-2   Up (healthy)
+simulador-mercado-order-service-3   Up (healthy)
+simulador-mercado-price-service-1   Up (healthy)
+simulador-mercado-price-service-2   Up (healthy)
+simulador-mercado-price-service-3   Up (healthy)
+simulador-mercado-user-service-1    Up (healthy)
+simulador-mercado-user-service-2    Up (healthy)
+simulador-mercado-user-service-3    Up (healthy)
+```
+
+### TEST 23 — NGINX reparte HTTP entre las 3 réplicas
+
+```bash
+for i in $(seq 1 12); do
+  curl -s -D - -o /dev/null localhost:8080/orders | grep -i "^x-instance"
+done | sort | uniq -c
+```
+
+**Resultado:** 12 peticiones → **4 / 4 / 4** (round robin exacto). Igual para `/prices` y `/users`:
+```
+   4 X-Instance: 0ea4b0ed3b51
+   4 X-Instance: 380678955bce
+   4 X-Instance: a74572130ae0
+```
+
+### TEST 24 — El Go Gateway reparte gRPC entre las 3 réplicas
+
+```bash
+for i in $(seq 1 12); do
+  curl -s -D - -o /dev/null localhost:8090/grpc/prices | grep -i "^x-served-by"
+done | sort | uniq -c
+```
+
+**Resultado:** cada **llamada gRPC** cae en una réplica distinta (5 / 4 / 3 en 12 llamadas;
+`round_robin` de gRPC reparte por turnos por subconexión, no es un contador exacto como NGINX):
+```
+   5 X-Served-By: 02bbde3a5443
+   4 X-Served-By: 4c7157ce218b
+   3 X-Served-By: 58a6614207eb
+```
+
+### TEST 25 — Una sola base de datos: lo que escribe una réplica lo ve otra
+
+Se crean 3 órdenes (cada POST lo atiende una réplica distinta) y se leen desde otras réplicas:
+
+```bash
+curl -s -D - -X POST localhost:8080/orders/create -H "Content-Type: application/json" \
+  -d '{"symbol":"BTC/USD","side":"SELL","price":63469,"amount":0.1}' | grep -iE "x-instance|status"
+```
+
+**Resultado:** los 3 POST fueron atendidos por `380678955bce`, `a74572130ae0` y `0ea4b0ed3b51`,
+y **las 6 lecturas posteriores, hechas por distintas réplicas, devolvieron las mismas 3 órdenes**
+(`[(1,'FILLED'),(2,'FILLED'),(3,'FILLED')]`). Eso solo es posible con una DB compartida.
+
+### TEST 26 — El tick de precios no se multiplica por 3
+
+```bash
+docker compose logs price-service --since 30s | grep -c "publicado en prices.updated"
+```
+
+**Resultado:** `18` publicaciones en 30 s (6 ticks × 3 símbolos). Sin el control serían ~54.
+Las 3 réplicas se turnan, pero cada tick lo mueve **una sola**.
+
+### TEST 27 — Cada orden se completa una sola vez (competing consumers)
+
+```bash
+docker compose logs order-service | grep "completada" | sed -E 's/.*(orden #[0-9]+).*/\1/' | sort | uniq -c
+```
+
+**Resultado:** cada orden aparece **1 vez**, aunque las 3 réplicas escuchan `prices.updated`:
+```
+   1 orden #1
+   1 orden #2
+   1 orden #3
+```
+
+### Escalar a más réplicas
+
+```bash
+docker compose up -d --scale order-service=5
+```
+
+> **Límite honesto:** con `--scale` los puertos fijos del host (`9101-9103`) se acaban. Para
+> probar con `grpcurl` desde el host solo hay 3 por servicio; la comunicación interna
+> (NGINX y Go Gateway) no tiene ese límite.
+
+---
+
 ## Nginx Gateway — configuración
 
 El archivo [`nginx-gateway/nginx.conf`](nginx-gateway/nginx.conf) tiene dos partes:
@@ -977,6 +1093,12 @@ upstream price_service {
 upstream user_service {
     server user-service:8083;
 }
+upstream notification_service {
+    server notification-service:8084;
+}
+upstream consul {
+    server consul:8500;
+}
 ```
 
 ### 2. Location blocks — Reverse Proxy
@@ -991,6 +1113,12 @@ location /prices {
 location /users {
     proxy_pass http://user_service;
 }
+location /events {                      # bitácora de Kafka
+    proxy_pass http://notification_service;
+}
+location /services {                    # service discovery (Consul)
+    proxy_pass http://consul/v1/agent/services;
+}
 ```
 
 ---
@@ -999,13 +1127,16 @@ location /users {
 
 | Patrón | Dónde |
 |---|---|
-| MVC | Cada microservicio (struct + SQLite + handler) |
+| MVC | Cada microservicio (struct + PostgreSQL + handler) |
 | API Gateway | nginx-gateway como punto de entrada HTTP |
 | API Gateway gRPC | go-gateway como punto de entrada gRPC-proxy |
 | Reverse Proxy | `proxy_pass` en nginx.conf |
 | Load Balancer Round Robin HTTP | `upstream` blocks en nginx.conf |
-| Load Balancer Round Robin gRPC | `grpcPool.next()` en gateway/main.go |
-| Database per Service | Cada servicio con su propio SQLite aislado |
+| Load Balancer Round Robin gRPC | `round_robin` sobre DNS en `gateway/main.go` |
+| Horizontal Scaling / Réplicas | `deploy.replicas: 3` por servicio (9 backends) |
+| Shared Database | Un solo PostgreSQL para las 9 réplicas |
+| Atomic Update (sin locks en código) | `UPDATE … RETURNING` en matching y en el tick de precios |
+| Competing Consumers (réplicas) | Las 3 réplicas de `order-service` comparten el grupo `order-matcher` |
 | Server Reflection | `reflection.Register` en cada servidor gRPC |
 | Publish / Subscribe | Tópicos de Kafka en `events.go` |
 | Message Queue | Consumer groups (`order-matcher`, `notif-*`) |
@@ -1022,7 +1153,9 @@ location /users {
 - **Apache Kafka 3.7 (modo KRaft)** — cola de mensajería asíncrona
 - **segmentio/kafka-go** — cliente de Kafka en Go puro (sin dependencias de C)
 - **Kafka UI** — interfaz web para ver tópicos, mensajes y colas
-- **SQLite** — base de datos por servicio
+- **PostgreSQL 16** — base de datos única compartida por los 9 backends
+- **lib/pq** — driver de PostgreSQL en Go puro (sin CGO)
+- **SQLite** — solo en notification-service (bitácora)
 - **Nginx** — frontend + gateway HTTP/reverse proxy/load balancer
 - **Docker + Docker Compose** — contenedores y orquestación
 - **Consul** — service discovery

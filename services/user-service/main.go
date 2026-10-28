@@ -16,8 +16,9 @@ import (
 
 	pb "user-service/proto"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/lib/pq"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -32,28 +33,30 @@ type User struct {
 
 var db *sql.DB
 
+// hostname identifica a ESTA réplica (en Docker es el id corto del contenedor).
+var hostname, _ = os.Hostname()
+
+// withInstance agrega el header X-Instance para ver qué réplica contestó.
+func withInstance(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Instance", hostname)
+		h(w, r)
+	}
+}
+
+// initDB se conecta a la base de datos ÚNICA (PostgreSQL) compartida por todas
+// las réplicas. Las tablas y el usuario demo los crea db/init.sql.
 func initDB() {
 	var err error
-	db, err = sql.Open("sqlite3", "/data/users.db")
+	db, err = sql.Open("postgres", os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatal("Error abriendo la base de datos:", err)
 	}
-
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS users (
-		id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		name       TEXT    NOT NULL,
-		email      TEXT    NOT NULL UNIQUE,
-		balance    REAL    NOT NULL DEFAULT 10000.0,
-		created_at DATETIME NOT NULL
-	)`)
-	if err != nil {
-		log.Fatal("Error creando tabla users:", err)
+	if err = db.Ping(); err != nil {
+		log.Fatal("No se pudo conectar a PostgreSQL:", err)
 	}
 
-	db.Exec(`INSERT OR IGNORE INTO users (name, email, balance, created_at) VALUES (?, ?, ?, ?)`,
-		"Trader Demo", "demo@mercado.com", 10000.0, time.Now())
-
-	log.Println("Base de datos de usuarios lista.")
+	log.Printf("Conectado a PostgreSQL (réplica %s).", hostname)
 }
 
 // ─── gRPC server ──────────────────────────────────────────────────────────────
@@ -96,14 +99,14 @@ func (s *userGRPCServer) CreateUser(_ context.Context, req *pb.CreateUserRequest
 		balance = 10000.0
 	}
 	now := time.Now()
-	res, err := db.Exec(
-		"INSERT INTO users (name, email, balance, created_at) VALUES (?, ?, ?, ?)",
+	var id int
+	err := db.QueryRow(
+		"INSERT INTO users (name, email, balance, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
 		req.Name, req.Email, balance, now,
-	)
+	).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
-	id, _ := res.LastInsertId()
 
 	// Kafka: avisamos que se registró un trader nuevo.
 	publishEvent(TopicUsersRegistered, req.Email, User{
@@ -123,12 +126,19 @@ func (s *userGRPCServer) CreateUser(_ context.Context, req *pb.CreateUserRequest
 	}, nil
 }
 
+// instanceInterceptor manda el hostname de la réplica en un header gRPC,
+// para que el gateway pueda mostrar quién atendió la llamada.
+func instanceInterceptor(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (interface{}, error) {
+	grpc.SetHeader(ctx, metadata.Pairs("x-instance", hostname))
+	return h(ctx, req)
+}
+
 func startGRPC() {
 	lis, err := net.Listen("tcp", ":9093")
 	if err != nil {
 		log.Fatalf("gRPC listen error: %v", err)
 	}
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(grpc.UnaryInterceptor(instanceInterceptor))
 	pb.RegisterUserServiceServer(srv, &userGRPCServer{})
 	reflection.Register(srv)
 	log.Println("user-service gRPC corriendo en :9093")
@@ -174,15 +184,12 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 	}
 	u.CreatedAt = time.Now()
 
-	res, err := db.Exec("INSERT INTO users (name, email, balance, created_at) VALUES (?, ?, ?, ?)",
-		u.Name, u.Email, u.Balance, u.CreatedAt)
+	err := db.QueryRow("INSERT INTO users (name, email, balance, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
+		u.Name, u.Email, u.Balance, u.CreatedAt).Scan(&u.ID)
 	if err != nil {
 		http.Error(w, "Error guardando usuario (email ya existe?)", http.StatusConflict)
 		return
 	}
-
-	id, _ := res.LastInsertId()
-	u.ID = int(id)
 
 	// Kafka: mismo evento que en el camino gRPC.
 	publishEvent(TopicUsersRegistered, u.Email, u)
@@ -198,12 +205,12 @@ func registerConsul() {
 		consulAddr = "consul:8500"
 	}
 	payload := map[string]interface{}{
-		"ID":      "user-service",
+		"ID":      "user-service-" + hostname,
 		"Name":    "user-service",
-		"Address": "user-service",
+		"Address": hostname,
 		"Port":    8083,
 		"Check": map[string]string{
-			"HTTP":     "http://user-service:8083/health",
+			"HTTP":     "http://" + hostname + ":8083/health",
 			"Interval": "10s",
 			"Timeout":  "3s",
 		},
@@ -229,7 +236,7 @@ func deregisterConsul() {
 	if consulAddr == "" {
 		consulAddr = "consul:8500"
 	}
-	req, _ := http.NewRequest(http.MethodPut, "http://"+consulAddr+"/v1/agent/service/deregister/user-service", nil)
+	req, _ := http.NewRequest(http.MethodPut, "http://"+consulAddr+"/v1/agent/service/deregister/user-service-"+hostname, nil)
 	client := &http.Client{Timeout: 3 * time.Second}
 	client.Do(req)
 	log.Println("Desregistrado de Consul")
@@ -252,11 +259,11 @@ func main() {
 		os.Exit(0)
 	}()
 
-	http.HandleFunc("/users", getUsers)
-	http.HandleFunc("/users/create", createUser)
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/users", withInstance(getUsers))
+	http.HandleFunc("/users/create", withInstance(createUser))
+	http.HandleFunc("/health", withInstance(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, `{"status":"ok","service":"user-service"}`)
-	})
+	}))
 
 	log.Println("user-service HTTP corriendo en :8083")
 	log.Fatal(http.ListenAndServe(":8083", nil))
